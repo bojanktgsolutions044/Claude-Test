@@ -10,6 +10,7 @@ import re
 import random
 import sys
 import argparse
+import csv
 from dataclasses import dataclass, asdict
 from typing import Optional
 import warnings
@@ -165,9 +166,15 @@ def process_brands(brands: list, use_claude: bool = True, output_file: str = "re
 
         results.append(result)
 
-        # Save progress after each brand
+        # Save progress after each brand (JSON + CSV)
         with open(output_file, "w") as f:
             json.dump([asdict(r) for r in results], f, indent=2)
+
+        csv_file = output_file.replace(".json", ".csv")
+        with open(csv_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["input_brand", "amazon_search_url", "official_website", "confidence", "notes"])
+            writer.writeheader()
+            writer.writerows([asdict(r) for r in results])
 
         if i < len(brands):
             random_delay(3, 6)
@@ -212,7 +219,9 @@ def main():
     print(f"Processing {len(brands)} brand(s)...")
     results = process_brands(brands, use_claude=not args.no_claude, output_file=args.output)
     print_summary(results)
+    csv_file = args.output.replace(".json", ".csv")
     print(f"\nSaved to: {args.output}")
+    print(f"Spreadsheet: {csv_file}  ← open this in Excel or Numbers")
 
 
 if __name__ == "__main__":
