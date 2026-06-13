@@ -1,0 +1,30 @@
+[
+  {
+    "input_brand": "Americanflat",
+    "amazon_search_url": "https://www.amazon.com/s?k=Americanflat",
+    "official_website": "https://www.americanflat.com",
+    "confidence": "high",
+    "notes": "Picture frames and wall decor brand"
+  },
+  {
+    "input_brand": "UpSimples",
+    "amazon_search_url": "https://www.amazon.com/s?k=UpSimples",
+    "official_website": "https://www.upsimples.com",
+    "confidence": "high",
+    "notes": "Picture frames brand sold primarily on Amazon"
+  },
+  {
+    "input_brand": "MCS",
+    "amazon_search_url": "https://www.amazon.com/s?k=MCS",
+    "official_website": "https://www.mcsindustries.com",
+    "confidence": "high",
+    "notes": "MCS Industries - frames and wall decor manufacturer"
+  },
+  {
+    "input_brand": "Baby Sense",
+    "amazon_search_url": "https://www.amazon.com/s?k=Baby+Sense",
+    "official_website": "https://www.babysense.com",
+    "confidence": "high",
+    "notes": "Baby monitor and infant safety products brand"
+  }
+]
