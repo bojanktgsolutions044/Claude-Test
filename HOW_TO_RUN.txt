@@ -1,0 +1,27 @@
+BRAND FINDER - HOW TO USE
+=========================
+
+STEP 1 - Open Terminal (Cmd + Space, type "terminal", press Enter)
+
+STEP 2 - Go to the brand-finder folder:
+cd ~/Desktop/brand-finder
+
+STEP 3 - Run with brands you type directly:
+python3 brand_finder.py --no-claude "Nike" "Sony" "Zara"
+
+        OR run with your brands.txt file:
+python3 brand_finder.py --no-claude --file brands.txt
+
+STEP 4 - Open results in Excel/Numbers:
+open ~/Desktop/brand-finder/results.csv
+
+
+TO ADD/CHANGE BRANDS IN brands.txt:
+open ~/Desktop/brand-finder/brands.txt
+
+
+GITHUB REPO (where the code lives):
+https://github.com/bojanktgsolutions044/Claude-Test
+
+TO UPDATE THE SCRIPT (if Claude makes improvements):
+curl -o brand_finder.py https://raw.githubusercontent.com/bojanktgsolutions044/Claude-Test/claude/confident-galileo-f45r6c/brand_finder.py
