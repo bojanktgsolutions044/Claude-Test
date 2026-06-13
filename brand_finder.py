@@ -74,11 +74,17 @@ def find_official_website(brand_name: str) -> str:
         "glassdoor.", "indeed.", "zoominfo.", "dnb.com",
         "alternativeto.", "g2.com", "capterra.", "crunchbase.",
         "owler.", "craft.co", "comparably.", "sitejabber.",
+        "sellersnooper.", "sellerapp.", "junglescout.", "helium10.",
+        "keepa.", "camelcamelcamel.", "sellercentral.", "merchantwords.",
+        "bing.com", "msn.com", "yahoo.com", "ask.com",
+        "ebay.", "walmart.", "target.", "etsy.", "wayfair.",
+        "homedepot.", "lowes.", "bestbuy.", "costco.",
     ]
     skip_url_patterns = [
         "promo-code", "promo_code", "coupon", "discount", "deals",
         "review", "/brand/", "store-list", "stores/", "tourdates",
-        "software/", "/wiki/", "directory/",
+        "software/", "/wiki/", "directory/", "seller-profiles/",
+        "aclick", "/video/", "/news/", "/article/",
     ]
 
     queries = [
@@ -125,13 +131,14 @@ def find_official_website(brand_name: str) -> str:
             if brand_slug in domain_clean:
                 return clean_url(url)
 
-        # Second pass: domain doesn't match but title strongly mentions the brand
+        # Second pass: domain contains at least one brand word
         for r in results:
             url = r.get("href", "")
-            title = r.get("title", "")
             if not url or is_bad_url(url):
                 continue
-            if title_matches(title):
+            domain = re.sub(r'https?://(www\.)?', '', url).split('/')[0]
+            domain_clean = re.sub(r'[^a-z0-9]', '', domain.lower())
+            if any(w in domain_clean for w in brand_words):
                 return clean_url(url)
 
         random_delay(2, 3)
