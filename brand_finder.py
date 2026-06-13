@@ -66,6 +66,82 @@ def clean_url(url: str) -> str:
     return re.sub(r'\?.*$', '', url).rstrip('/')
 
 
+def homepage_of(url: str) -> str:
+    """Return just the scheme + domain (the clean homepage) of a URL."""
+    m = re.match(r'(https?://[^/]+)', url)
+    return m.group(1) if m else clean_url(url)
+
+
+# Common words to ignore when extracting product keywords from Amazon titles
+STOPWORDS = {
+    "the", "and", "for", "with", "set", "pack", "of", "pcs", "pieces", "piece",
+    "inch", "inches", "size", "color", "black", "white", "gold", "silver", "blue",
+    "red", "green", "pink", "gray", "grey", "brown", "clear", "large", "small",
+    "medium", "new", "premium", "quality", "best", "pro", "plus", "kit", "count",
+    "x", "in", "to", "by", "or", "a", "an", "your", "our", "all", "each",
+}
+
+
+def get_amazon_product_keywords(brand_name: str, max_titles: int = 6) -> list:
+    """
+    Fetch the Amazon search page for a brand and extract the product-type
+    keywords from the organic listing titles (e.g. "picture", "frame").
+    These describe the brand's *industry* so we can match the right website.
+    """
+    if not HAS_REQUESTS:
+        return []
+
+    try:
+        resp = requests.get(make_amazon_url(brand_name), headers=amazon_headers(), timeout=15)
+        if resp.status_code != 200:
+            return []
+    except Exception:
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    result_divs = soup.find_all("div", attrs={"data-component-type": "s-search-result"})
+
+    brand_words = {re.sub(r'[^a-z0-9]', '', w.lower()) for w in brand_name.split()}
+    counts = {}
+    titles_used = 0
+
+    for div in result_divs:
+        if titles_used >= max_titles:
+            break
+        # Skip sponsored listings
+        if div.find(lambda tag: tag.name in ("span", "a") and "Sponsored" in tag.get_text()):
+            continue
+        h2 = div.find("h2")
+        title = h2.get_text(" ", strip=True) if h2 else ""
+        if not title:
+            continue
+        titles_used += 1
+        for raw in re.findall(r"[a-zA-Z]+", title.lower()):
+            if len(raw) < 4 or raw in STOPWORDS or raw in brand_words:
+                continue
+            counts[raw] = counts.get(raw, 0) + 1
+
+    # Keep keywords that show up in more than one listing (the real product type)
+    keywords = [w for w, c in sorted(counts.items(), key=lambda x: -x[1]) if c >= 2]
+    if not keywords:  # fall back to single-occurrence words if nothing repeats
+        keywords = [w for w, _ in sorted(counts.items(), key=lambda x: -x[1])]
+    return keywords[:8]
+
+
+def page_keyword_score(url: str, keywords: list) -> int:
+    """Fetch a candidate website and count how many product keywords it mentions."""
+    if not HAS_REQUESTS or not keywords:
+        return 0
+    try:
+        resp = requests.get(url, headers=amazon_headers(), timeout=12)
+        if resp.status_code != 200:
+            return 0
+    except Exception:
+        return 0
+    text = BeautifulSoup(resp.text, "html.parser").get_text(" ", strip=True).lower()
+    return sum(1 for kw in keywords if kw in text)
+
+
 def find_official_website(brand_name: str) -> str:
     skip_domains = [
         "amazon.", "wikipedia.", "facebook.", "instagram.",
@@ -86,6 +162,11 @@ def find_official_website(brand_name: str) -> str:
         "software/", "/wiki/", "directory/", "seller-profiles/",
         "aclick", "/video/", "/news/", "/article/",
     ]
+    # Presentation / document / Q&A junk that sometimes ranks for odd names
+    skip_domains += [
+        "prezi.", "slideshare.", "scribd.", "issuu.", "quora.",
+        "medium.com", "blogspot.", "wordpress.com", "ktiv.",
+    ]
 
     queries = [
         f'"{brand_name}" official website',
@@ -93,7 +174,7 @@ def find_official_website(brand_name: str) -> str:
     ]
 
     brand_slug = re.sub(r'[^a-z0-9]', '', brand_name.lower())
-    # Build word tokens for title matching (e.g. "Baby Sense" → ["baby", "sense"])
+    # Build word tokens for matching (e.g. "Baby Sense" → ["baby", "sense"])
     brand_words = [w.lower() for w in brand_name.split() if len(w) > 2]
 
     def is_bad_url(url):
@@ -103,11 +184,14 @@ def find_official_website(brand_name: str) -> str:
             return True
         return False
 
-    def title_matches(title: str) -> bool:
-        """Check if the result title looks related to the brand."""
-        t = title.lower()
-        return any(w in t for w in brand_words)
+    # What product type does this brand sell on Amazon? (e.g. picture frames)
+    product_keywords = get_amazon_product_keywords(brand_name)
+    if product_keywords:
+        print(f"  Amazon product type: {', '.join(product_keywords[:5])}")
 
+    # Collect candidate websites from all queries
+    candidates = []  # list of (url, domain_score)
+    seen_domains = set()
     for query in queries:
         try:
             with DDGS() as ddgs:
@@ -116,34 +200,48 @@ def find_official_website(brand_name: str) -> str:
             print(f"  [search error] {e}")
             random_delay(3, 6)
             continue
-
         if not results:
             random_delay(2, 4)
             continue
 
-        # First pass: domain contains the brand name (strongest signal)
         for r in results:
             url = r.get("href", "")
             if not url or is_bad_url(url):
                 continue
             domain = re.sub(r'https?://(www\.)?', '', url).split('/')[0]
             domain_clean = re.sub(r'[^a-z0-9]', '', domain.lower())
+            if domain in seen_domains:
+                continue
+
+            # Domain relevance score
             if brand_slug in domain_clean:
-                return clean_url(url)
+                domain_score = 5
+            elif any(w in domain_clean for w in brand_words):
+                domain_score = 2
+            else:
+                continue  # domain unrelated to brand → ignore entirely
 
-        # Second pass: domain contains at least one brand word
-        for r in results:
-            url = r.get("href", "")
-            if not url or is_bad_url(url):
-                continue
-            domain = re.sub(r'https?://(www\.)?', '', url).split('/')[0]
-            domain_clean = re.sub(r'[^a-z0-9]', '', domain.lower())
-            if any(w in domain_clean for w in brand_words):
-                return clean_url(url)
-
+            seen_domains.add(domain)
+            candidates.append((url, domain_score))
         random_delay(2, 3)
 
-    return ""
+    if not candidates:
+        return ""
+
+    # Score each candidate: domain relevance + how well the homepage's
+    # content matches the product type found on Amazon (the "industry").
+    best_url, best_score = "", -1
+    for url, domain_score in candidates:
+        home = homepage_of(url)
+        product_score = page_keyword_score(home, product_keywords)
+        total = domain_score + product_score * 2  # weight product match heavily
+        if product_keywords:
+            print(f"    candidate {home}  (domain {domain_score}, product match {product_score})")
+        if total > best_score:
+            best_url, best_score = home, total
+        random_delay(1, 2)
+
+    return best_url
 
 
 def amazon_headers() -> dict:
