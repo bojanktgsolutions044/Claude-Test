@@ -166,6 +166,8 @@ def find_official_website(brand_name: str) -> str:
     skip_domains += [
         "prezi.", "slideshare.", "scribd.", "issuu.", "quora.",
         "medium.com", "blogspot.", "wordpress.com", "ktiv.",
+        "seovip.", "alibaba.", "aliexpress.", "made-in-china.",
+        "dhgate.", "tradeindia.", "indiamart.",
     ]
 
     queries = [
@@ -195,7 +197,7 @@ def find_official_website(brand_name: str) -> str:
         queries.append(f'"{brand_name}" {top_products} brand site')
 
     # Collect candidate websites from all queries
-    candidates = []  # list of (url, domain_score)
+    candidates = []  # list of (url, domain)
     seen_domains = set()
     for query in queries:
         try:
@@ -213,40 +215,75 @@ def find_official_website(brand_name: str) -> str:
             url = r.get("href", "")
             if not url or is_bad_url(url):
                 continue
-            domain = re.sub(r'https?://(www\.)?', '', url).split('/')[0]
-            domain_clean = re.sub(r'[^a-z0-9]', '', domain.lower())
+            domain = re.sub(r'https?://(www\.)?', '', url).split('/')[0].lower()
+            domain_clean = re.sub(r'[^a-z0-9]', '', domain)
             if domain in seen_domains:
                 continue
-
-            # Domain relevance score
-            if brand_slug in domain_clean:
-                domain_score = 5
-            elif any(w in domain_clean for w in brand_words):
-                domain_score = 2
-            else:
-                continue  # domain unrelated to brand → ignore entirely
-
+            # Domain must relate to the brand, else ignore entirely
+            if brand_slug not in domain_clean and not any(w in domain_clean for w in brand_words):
+                continue
             seen_domains.add(domain)
-            candidates.append((url, domain_score))
+            candidates.append((url, domain))
         random_delay(2, 3)
 
     if not candidates:
         return ""
 
-    # Score each candidate: domain relevance + how well the homepage's
-    # content matches the product type found on Amazon (the "industry").
-    best_url, best_score = "", -1
-    for url, domain_score in candidates:
+    # Foreign country TLDs we de-prioritize (prefer global .com for US Amazon)
+    foreign_tlds = (".de", ".fr", ".es", ".it", ".nl", ".au", ".ca", ".co.uk",
+                    ".uk", ".jp", ".cn", ".in", ".br", ".mx", ".ru", ".pl")
+
+    def domain_score(domain: str) -> int:
+        """Score how 'official' a domain looks for this brand (higher = better)."""
+        parts = domain.split(".")
+        core = parts[0]  # the part before the first dot
+        core_clean = re.sub(r'[^a-z0-9]', '', core)
+        domain_clean = re.sub(r'[^a-z0-9]', '', domain)
+        score = 0
+
+        # Exact brand-name domain is the strongest signal
+        if core_clean == brand_slug:
+            score += 14
+        elif brand_slug and brand_slug in domain_clean:
+            score += 9
+        # Reward each brand word present (e.g. "better" + "office")
+        score += sum(3 for w in brand_words if w in domain_clean)
+
+        # TLD preferences
+        if domain.endswith(".com"):
+            score += 3
+        elif domain.endswith((".co", ".net", ".store", ".shop", ".org")):
+            score += 1
+        if domain.endswith(foreign_tlds):
+            score -= 3
+
+        # Penalize spammy / subdomain-on-unrelated-host domains
+        if domain.count(".") >= 3:        # e.g. bsrhome.com.seovip.biz
+            score -= 8
+        return score
+
+    # Score each candidate: domain relevance is primary, product-type match
+    # (does the site actually sell what the brand sells on Amazon?) breaks ties.
+    scored = []
+    for url, domain in candidates:
         home = homepage_of(url)
-        product_score = page_keyword_score(home, product_keywords)
-        total = domain_score + product_score * 2  # weight product match heavily
+        d_score = domain_score(domain)
+        p_score = page_keyword_score(home, product_keywords)
         if product_keywords:
-            print(f"    candidate {home}  (domain {domain_score}, product match {product_score})")
-        if total > best_score:
-            best_url, best_score = home, total
+            print(f"    candidate {home}  (domain {d_score}, product match {p_score})")
+        scored.append((d_score, p_score, home, domain))
         random_delay(1, 2)
 
-    return best_url
+    # Deterministic ranking: domain score, then product match, then prefer
+    # .com, then shorter domain, then alphabetical — so runs are consistent.
+    scored.sort(key=lambda c: (
+        c[0],                       # domain score
+        min(c[1], 4),               # product match (capped so it can't dominate)
+        c[3].endswith(".com"),      # prefer .com
+        -len(c[3]),                 # prefer shorter domain
+    ), reverse=True)
+
+    return scored[0][2]
 
 
 def amazon_headers() -> dict:
