@@ -14,12 +14,15 @@ from dataclasses import dataclass, asdict
 from typing import Optional
 
 try:
-    from duckduckgo_search import DDGS
+    from ddgs import DDGS
     HAS_DDGS = True
 except ImportError:
-    HAS_DDGS = False
-    print("[warn] duckduckgo_search not installed.")
-    print("       Run: pip install duckduckgo-search")
+    try:
+        from duckduckgo_search import DDGS
+        HAS_DDGS = True
+    except ImportError:
+        HAS_DDGS = False
+        print("[warn] ddgs not installed. Run: pip install ddgs")
 
 try:
     import anthropic
@@ -58,7 +61,7 @@ def search_amazon_via_ddg(brand_name: str) -> dict:
     Search for a brand on Amazon using DuckDuckGo (avoids Amazon bot detection).
     Returns brand name, seller, and Amazon URL extracted from search results.
     """
-    query = f"{brand_name} brand site:amazon.com"
+    query = f"{brand_name} amazon.com brand store"
     results = ddg_search(query, max_results=5)
 
     if not results:
