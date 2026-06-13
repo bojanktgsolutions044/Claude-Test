@@ -188,6 +188,11 @@ def find_official_website(brand_name: str) -> str:
     product_keywords = get_amazon_product_keywords(brand_name)
     if product_keywords:
         print(f"  Amazon product type: {', '.join(product_keywords[:5])}")
+        # Add a product-aware query so generic brand names (e.g. "MCS") surface
+        # the right niche site (e.g. mcsindustries.com) rather than unrelated ones
+        top_products = " ".join(product_keywords[:3])
+        queries.append(f"{brand_name} {top_products} official website")
+        queries.append(f'"{brand_name}" {top_products} brand site')
 
     # Collect candidate websites from all queries
     candidates = []  # list of (url, domain_score)
