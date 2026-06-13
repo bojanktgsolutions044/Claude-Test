@@ -2,6 +2,7 @@
 """
 Brand Finder: Given a list of brand names, finds their official website
 and generates a direct Amazon search link for each brand.
+If no website is found, falls back to scraping Amazon for seller business info.
 """
 
 import time
@@ -11,7 +12,7 @@ import random
 import sys
 import argparse
 import csv
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, field, asdict
 from typing import Optional
 import warnings
 warnings.filterwarnings("ignore")
@@ -24,6 +25,14 @@ except ImportError:
     except ImportError:
         print("ERROR: Run this first:  pip3 install ddgs")
         sys.exit(1)
+
+try:
+    import requests
+    from bs4 import BeautifulSoup
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+    print("WARNING: pip3 install requests beautifulsoup4  (needed for Amazon seller lookup)")
 
 try:
     import anthropic
@@ -39,6 +48,8 @@ class BrandResult:
     official_website: Optional[str] = None
     confidence: str = "low"
     notes: str = ""
+    seller_business_name: str = ""
+    seller_business_address: str = ""
 
 
 def random_delay(min_s=2.0, max_s=5.0):
@@ -46,13 +57,11 @@ def random_delay(min_s=2.0, max_s=5.0):
 
 
 def make_amazon_url(brand_name: str) -> str:
-    """Build a direct Amazon search URL for the brand."""
     query = brand_name.strip().replace(" ", "+")
     return f"https://www.amazon.com/s?k={query}"
 
 
 def find_official_website(brand_name: str) -> str:
-    """Use DuckDuckGo to find the official website for a brand."""
     skip_domains = [
         "amazon.", "wikipedia.", "facebook.", "instagram.",
         "twitter.", "linkedin.", "yelp.", "reddit.", "youtube.",
@@ -79,7 +88,6 @@ def find_official_website(brand_name: str) -> str:
 
         brand_slug = re.sub(r'[^a-z0-9]', '', brand_name.lower())
 
-        # First pass: prefer URLs that contain the brand name
         for r in results:
             url = r.get("href", "")
             if not url or any(d in url for d in skip_domains):
@@ -89,7 +97,6 @@ def find_official_website(brand_name: str) -> str:
             if brand_slug in domain_clean:
                 return url
 
-        # Second pass: first non-skipped result
         for r in results:
             url = r.get("href", "")
             if url and not any(d in url for d in skip_domains):
@@ -100,8 +107,169 @@ def find_official_website(brand_name: str) -> str:
     return ""
 
 
+def amazon_headers() -> dict:
+    """Return headers that mimic a real browser to reduce Amazon blocking."""
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    }
+
+
+def get_organic_product_urls(brand_name: str, max_results: int = 2) -> list:
+    """
+    Search Amazon for the brand and return URLs of the first organic
+    (non-sponsored) product listings.
+    """
+    if not HAS_REQUESTS:
+        return []
+
+    search_url = make_amazon_url(brand_name)
+    print(f"  Fetching Amazon search results...")
+
+    try:
+        resp = requests.get(search_url, headers=amazon_headers(), timeout=15)
+        if resp.status_code != 200:
+            print(f"  [amazon] Search page returned status {resp.status_code}")
+            return []
+    except Exception as e:
+        print(f"  [amazon] Could not fetch search page: {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Each search result sits in a div with data-component-type="s-search-result"
+    result_divs = soup.find_all("div", attrs={"data-component-type": "s-search-result"})
+
+    organic_urls = []
+    for div in result_divs:
+        if len(organic_urls) >= max_results:
+            break
+
+        # Skip sponsored listings — they carry a "Sponsored" label
+        sponsored = div.find(lambda tag: tag.name in ("span", "a") and
+                             "Sponsored" in tag.get_text())
+        if sponsored:
+            continue
+
+        # Find the product link (the main title link)
+        link_tag = div.find("a", class_=re.compile(r"s-link-style|a-link-normal"))
+        if not link_tag:
+            link_tag = div.find("a", href=re.compile(r"/dp/"))
+        if link_tag and link_tag.get("href"):
+            href = link_tag["href"]
+            if not href.startswith("http"):
+                href = "https://www.amazon.com" + href
+            organic_urls.append(href)
+
+    return organic_urls
+
+
+def get_seller_id_from_product(product_url: str) -> Optional[str]:
+    """Visit a product page and return the seller ID from the 'Sold by' link."""
+    if not HAS_REQUESTS:
+        return None
+
+    try:
+        resp = requests.get(product_url, headers=amazon_headers(), timeout=15)
+        if resp.status_code != 200:
+            return None
+    except Exception as e:
+        print(f"  [amazon] Could not fetch product page: {e}")
+        return None
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # "Sold by" link typically points to /sp?seller=XXXX or contains seller= in href
+    sold_by = soup.find("a", href=re.compile(r"seller="))
+    if sold_by:
+        href = sold_by["href"]
+        match = re.search(r"seller=([A-Z0-9]+)", href)
+        if match:
+            return match.group(1)
+
+    return None
+
+
+def get_seller_info(seller_id: str) -> dict:
+    """
+    Visit the Amazon seller info page and extract business name and address
+    from the 'Detailed Seller Information' section.
+    """
+    if not HAS_REQUESTS:
+        return {}
+
+    url = f"https://www.amazon.com/sp?seller={seller_id}"
+    try:
+        resp = requests.get(url, headers=amazon_headers(), timeout=15)
+        if resp.status_code != 200:
+            return {}
+    except Exception as e:
+        print(f"  [amazon] Could not fetch seller page: {e}")
+        return {}
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    info = {"business_name": "", "business_address": ""}
+
+    # Find the "Detailed Seller Information" section
+    detailed_section = soup.find(string=re.compile(r"Detailed Seller Information", re.I))
+    if detailed_section:
+        parent = detailed_section.find_parent()
+        if parent:
+            # Walk siblings/children to collect name and address text
+            container = parent.find_parent()
+            if container:
+                text_blocks = [t.strip() for t in container.stripped_strings]
+                # First non-header block is usually the business name
+                capture = False
+                collected = []
+                for t in text_blocks:
+                    if re.search(r"Detailed Seller Information", t, re.I):
+                        capture = True
+                        continue
+                    if capture and t:
+                        collected.append(t)
+                if collected:
+                    info["business_name"] = collected[0]
+                    info["business_address"] = ", ".join(collected[1:5])
+
+    return info
+
+
+def find_seller_via_amazon(brand_name: str) -> dict:
+    """
+    Orchestrates the Amazon fallback:
+    1. Search Amazon → find organic listings
+    2. Visit product page → get seller ID
+    3. Visit seller page → get business name + address
+    """
+    product_urls = get_organic_product_urls(brand_name)
+    if not product_urls:
+        print(f"  No organic Amazon listings found.")
+        return {}
+
+    for i, url in enumerate(product_urls, 1):
+        print(f"  Checking product {i}: {url[:70]}...")
+        random_delay(2, 4)
+        seller_id = get_seller_id_from_product(url)
+        if seller_id:
+            print(f"  Seller ID found: {seller_id}")
+            random_delay(2, 3)
+            info = get_seller_info(seller_id)
+            if info.get("business_name"):
+                return info
+
+    return {}
+
+
 def validate_with_claude(brand_name: str, website_candidate: str) -> dict:
-    """Use Claude to validate the website match."""
     if not HAS_CLAUDE:
         return {}
     client = anthropic.Anthropic()
@@ -138,11 +306,9 @@ def process_brands(brands: list, use_claude: bool = True, output_file: str = "re
         print(f"\n[{i}/{len(brands)}] {brand}")
         result = BrandResult(input_brand=brand)
 
-        # Always generate Amazon search URL (no scraping needed)
         result.amazon_search_url = make_amazon_url(brand)
         print(f"  Amazon search : {result.amazon_search_url}")
 
-        # Find official website via DuckDuckGo
         print(f"  Finding official website...")
         website = find_official_website(brand)
         result.official_website = website
@@ -150,29 +316,40 @@ def process_brands(brands: list, use_claude: bool = True, output_file: str = "re
         if website:
             print(f"  Website found : {website}")
             result.confidence = "medium"
-        else:
-            print(f"  Website       : not found")
 
-        # Optional Claude validation
-        if use_claude and HAS_CLAUDE and website:
-            print(f"  Validating with Claude...")
-            validation = validate_with_claude(brand, website)
-            if validation:
-                if not validation.get("is_correct", True):
-                    result.official_website = validation.get("official_website", website)
-                result.confidence = validation.get("confidence", result.confidence)
-                result.notes = validation.get("notes", "")
-                print(f"  Confidence    : {result.confidence}")
+            if use_claude and HAS_CLAUDE:
+                print(f"  Validating with Claude...")
+                validation = validate_with_claude(brand, website)
+                if validation:
+                    if not validation.get("is_correct", True):
+                        result.official_website = validation.get("official_website", website)
+                    result.confidence = validation.get("confidence", result.confidence)
+                    result.notes = validation.get("notes", "")
+                    print(f"  Confidence    : {result.confidence}")
+        else:
+            print(f"  Website not found — trying Amazon seller lookup...")
+            seller_info = find_seller_via_amazon(brand)
+            if seller_info:
+                result.seller_business_name = seller_info.get("business_name", "")
+                result.seller_business_address = seller_info.get("business_address", "")
+                print(f"  Business name : {result.seller_business_name}")
+                print(f"  Address       : {result.seller_business_address}")
+                result.confidence = "medium"
+                result.notes = "Website not found; seller info retrieved from Amazon"
+            else:
+                print(f"  No seller info found either.")
 
         results.append(result)
 
-        # Save progress after each brand (JSON + CSV)
         with open(output_file, "w") as f:
             json.dump([asdict(r) for r in results], f, indent=2)
 
         csv_file = output_file.replace(".json", ".csv")
         with open(csv_file, "w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["input_brand", "amazon_search_url", "official_website", "confidence", "notes"])
+            writer = csv.DictWriter(f, fieldnames=[
+                "input_brand", "amazon_search_url", "official_website",
+                "confidence", "notes", "seller_business_name", "seller_business_address"
+            ])
             writer.writeheader()
             writer.writerows([asdict(r) for r in results])
 
@@ -190,6 +367,10 @@ def print_summary(results: list):
         print(f"\nBrand           : {r.input_brand}")
         print(f"  Amazon search : {r.amazon_search_url}")
         print(f"  Official site : {r.official_website or 'not found'}")
+        if r.seller_business_name:
+            print(f"  Business name : {r.seller_business_name}")
+        if r.seller_business_address:
+            print(f"  Address       : {r.seller_business_address}")
         print(f"  Confidence    : {r.confidence}")
         if r.notes:
             print(f"  Notes         : {r.notes}")
