@@ -65,7 +65,13 @@ def find_official_website(brand_name: str) -> str:
     skip_domains = [
         "amazon.", "wikipedia.", "facebook.", "instagram.",
         "twitter.", "linkedin.", "yelp.", "reddit.", "youtube.",
-        "tiktok.", "pinterest."
+        "tiktok.", "pinterest.", "trustpilot.", "bbb.org",
+        "glassdoor.", "indeed.", "zoominfo.", "dnb.com",
+    ]
+    # Skip URLs that are clearly coupon/review/listing pages, not brand sites
+    skip_url_patterns = [
+        "promo-code", "promo_code", "coupon", "discount", "deals",
+        "review", "shop/", "/brand/", "store-list", "stores/",
     ]
 
     queries = [
@@ -76,7 +82,7 @@ def find_official_website(brand_name: str) -> str:
     for query in queries:
         try:
             with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=8))
+                results = list(ddgs.text(query, max_results=10))
         except Exception as e:
             print(f"  [search error] {e}")
             random_delay(3, 6)
@@ -88,18 +94,27 @@ def find_official_website(brand_name: str) -> str:
 
         brand_slug = re.sub(r'[^a-z0-9]', '', brand_name.lower())
 
+        def is_bad_url(url):
+            if any(d in url for d in skip_domains):
+                return True
+            if any(p in url.lower() for p in skip_url_patterns):
+                return True
+            return False
+
+        # First pass: URL contains the brand name itself (most reliable)
         for r in results:
             url = r.get("href", "")
-            if not url or any(d in url for d in skip_domains):
+            if not url or is_bad_url(url):
                 continue
             domain = re.sub(r'https?://(www\.)?', '', url).split('/')[0]
             domain_clean = re.sub(r'[^a-z0-9]', '', domain.lower())
             if brand_slug in domain_clean:
                 return url
 
+        # Second pass: first clean result that isn't a junk site
         for r in results:
             url = r.get("href", "")
-            if url and not any(d in url for d in skip_domains):
+            if url and not is_bad_url(url):
                 return url
 
         random_delay(2, 3)
