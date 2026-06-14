@@ -129,6 +129,44 @@ def claude_ask(prompt: str, max_tokens: int = 300) -> str:
         return ""
 
 
+def is_us_address(address: str) -> bool:
+    """
+    Decide whether a business address is in the US.
+    Returns True when the address looks US-based (or is unknown/empty, so we
+    don't wrongly skip USPTO), and False when it clearly names another country.
+    """
+    if not address or address == NO_INFO:
+        return True  # unknown — don't skip USPTO
+
+    addr = address.strip()
+    upper = addr.upper()
+
+    # Strong US signals: trailing ", US" / ", USA" or a US ZIP near the end
+    if re.search(r',\s*(US|USA|UNITED STATES)\b\.?\s*$', upper):
+        return True
+    if re.search(r'\b[A-Z]{2}\s*,?\s*\d{5}(-\d{4})?\b', upper):
+        return True
+
+    # Explicit non-US country codes/names (ISO + common spellings)
+    non_us = [
+        "CN", "CHINA", "HONG KONG", "HK", "UK", "UNITED KINGDOM", "GB",
+        "DE", "GERMANY", "FR", "FRANCE", "IT", "ITALY", "ES", "SPAIN",
+        "IN", "INDIA", "AE", "UAE", "UNITED ARAB EMIRATES", "CA", "CANADA",
+        "AU", "AUSTRALIA", "JP", "JAPAN", "KR", "KOREA", "VN", "VIETNAM",
+        "PL", "POLAND", "NL", "NETHERLANDS", "TR", "TURKEY", "MX", "MEXICO",
+        "SE", "SWEDEN", "IE", "IRELAND", "TW", "TAIWAN", "SG", "SINGAPORE",
+    ]
+    # Check the final segment of the address (country usually comes last)
+    last_part = upper.split(",")[-1].strip().rstrip(".")
+    if last_part in non_us:
+        return False
+    # Non-Latin characters (e.g. Chinese) strongly imply non-US
+    if re.search(r'[一-鿿぀-ヿ가-힯]', addr):
+        return False
+
+    return True  # default: treat as US-eligible
+
+
 def _domain_from_url(url: str) -> str:
     d = re.sub(r'https?://(www\.)?', '', url)
     return d.split('/')[0].split('?')[0].lower()
@@ -789,12 +827,16 @@ def process_brands(brands: list, output_file: str = "results.json") -> list:
             delay(1, 2)
             r.contact_email, r.contact_form_url = find_contact_info(r.official_website)
 
-        # 4. USPTO
+        # 4. USPTO — only for US-based businesses
         print(f"  STEP 4: USPTO trademark owner")
-        delay(1, 2)
-        tm = uspto_find_owner(brand, biz)
-        r.trademark_owner_first_name = tm["trademark_owner_first_name"]
-        r.trademark_owner_last_name  = tm["trademark_owner_last_name"]
+        if not is_us_address(r.amazon_seller_address):
+            print(f"    [uspto] Skipped — business address is outside the US")
+            r.notes = (r.notes + "; non-US seller, USPTO skipped").lstrip("; ")
+        else:
+            delay(1, 2)
+            tm = uspto_find_owner(brand, biz)
+            r.trademark_owner_first_name = tm["trademark_owner_first_name"]
+            r.trademark_owner_last_name  = tm["trademark_owner_last_name"]
 
         # 5. LinkedIn — company page + owner profile via DDG title searches
         print(f"  STEP 5: LinkedIn search")
