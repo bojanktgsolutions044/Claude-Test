@@ -265,25 +265,41 @@ def amazon_get_seller_info(brand: str) -> dict:
     return out
 
 
-# ── STEP 2: Official website ──────────────────────────────────────────────────
+# Sites that are NOT a brand's own homepage — social, marketplaces, and the
+# data-broker / company-directory aggregators that often outrank the real site.
+SKIP_SITE_DOMAINS = [
+    "amazon.", "wikipedia.", "facebook.", "instagram.", "twitter.", "x.com",
+    "linkedin.", "yelp.", "reddit.", "youtube.", "tiktok.", "pinterest.",
+    "walmart.", "ebay.", "etsy.", "shopify.com", "aliexpress.",
+    # data brokers / directories (these caused the zoominfo bug)
+    "zoominfo.", "crunchbase.", "bloomberg.", "dnb.com", "dunandbradstreet.",
+    "rocketreach.", "apollo.io", "pitchbook.", "owler.", "glassdoor.",
+    "indeed.", "leadiq.", "signalhire.", "kompass.", "manta.",
+    "bbb.org", "trustpilot.", "g2.com", "capterra.", "buzzfile.",
+]
+
+
+def _slug(s: str) -> str:
+    return re.sub(r'[^a-z0-9]', '', s.lower())
+
+
 def find_official_website(brand: str, business_name: str) -> str:
-    skip = [
-        "amazon.", "wikipedia.", "facebook.", "instagram.", "twitter.",
-        "linkedin.", "yelp.", "reddit.", "youtube.", "tiktok.",
-        "pinterest.", "walmart.", "ebay.", "etsy.", "shopify."
-    ]
+    """
+    Prefer the domain that actually matches the brand name (e.g. Americanflat
+    → americanflat.com). Only fall back to Claude when no domain clearly matches.
+    """
     candidates = []
     search_names = list(dict.fromkeys(x for x in [brand, business_name] if x and x != NO_INFO))
 
     for name in search_names:
-        for q in [f'"{name}" official website', f'"{name}" homepage brand']:
+        for q in [f'{name} official website', f'"{name}" homepage', name]:
             for h in ddg(q, n=8):
                 url = h.get("href", "")
-                if url and not any(s in url for s in skip):
+                if url and not any(s in url for s in SKIP_SITE_DOMAINS):
                     candidates.append(homepage(url))
-            if candidates:
+            if len(candidates) >= 4:
                 break
-        if candidates:
+        if len(candidates) >= 4:
             break
 
     if not candidates:
@@ -294,14 +310,24 @@ def find_official_website(brand: str, business_name: str) -> str:
         if c not in seen:
             seen.add(c); unique.append(c)
 
+    # 1) Strong match: a domain whose name contains the brand slug → use directly
+    brand_slug = _slug(brand)
+    for u in unique:
+        domain_slug = _slug(_domain_from_url(u).split(".")[0])
+        if brand_slug and (brand_slug in domain_slug or domain_slug in brand_slug):
+            print(f"    [website] Brand-matched domain: {u}")
+            return u
+
+    # 2) Otherwise let Claude pick from the candidates
     best = unique[0]
     if HAS_CLAUDE and len(unique) > 1:
         names_str = " / ".join(search_names)
         options = "\n".join(f"{i+1}. {u}" for i, u in enumerate(unique[:5]))
         answer = claude_ask(
             f'Brand: "{names_str}"\nCandidate homepages:\n{options}\n\n'
-            f'Which is the correct official brand homepage selling the same products? '
-            f'Reply with ONLY the URL. If none are correct, reply: No Info'
+            f'Which is the brand\'s OWN official homepage (not a directory, '
+            f'data-broker, or marketplace)? Reply with ONLY the URL. '
+            f'If none are correct, reply: No Info'
         )
         if answer.startswith("http"):
             best = homepage(answer)
@@ -410,16 +436,34 @@ def uspto_find_owner(brand: str, business_name: str) -> dict:
 
 
 # ── STEP 5: LinkedIn via DDG ──────────────────────────────────────────────────
+def _name_from_linkedin_title(title: str) -> tuple:
+    """
+    LinkedIn result titles look like:
+      'Giorgio Piccoli - Founder - Americanflat | LinkedIn'
+    Return (first, last) parsed from the part before the first ' - ' or '|'.
+    """
+    head = re.split(r'\s[-–|]\s', title.strip())[0].strip()
+    head = re.sub(r'\s*\|\s*LinkedIn.*$', '', head, flags=re.I).strip()
+    # Reject if it doesn't look like a person's name
+    if not head or len(head.split()) < 2 or len(head) > 50:
+        return NO_INFO, NO_INFO
+    parts = head.split()
+    return parts[0], " ".join(parts[1:])
+
+
 def find_linkedin_urls(brand: str, business_name: str) -> dict:
     """
     A. Company page: search '{brand} site:linkedin.com/company' on DDG.
     B. Owner page: search '{brand} {Title} linkedin' for each title in priority
        order; take the first linkedin.com/in/ URL whose snippet mentions the title.
+       Also extract the owner's real name from the result title.
     """
     out = {
         "company_linkedin_url": NO_INFO,
         "owner_linkedin_url": NO_INFO,
         "owner_linkedin_title": NO_INFO,
+        "owner_first": NO_INFO,
+        "owner_last": NO_INFO,
     }
     search_name = business_name if (business_name and business_name != NO_INFO) else brand
 
@@ -445,11 +489,15 @@ def find_linkedin_urls(brand: str, business_name: str) -> dict:
         q = f'"{brand}" {title} linkedin'
         for h in ddg(q, n=6):
             url = h.get("href", "")
-            snippet = (h.get("body", "") + h.get("title", "")).lower()
+            result_title = h.get("title", "")
+            snippet = (h.get("body", "") + result_title).lower()
             if "linkedin.com/in/" in url and title.lower() in snippet:
                 out["owner_linkedin_url"] = url.split("?")[0]
                 out["owner_linkedin_title"] = title
-                print(f"    [linkedin] Owner ({title}): {out['owner_linkedin_url']}")
+                first, last = _name_from_linkedin_title(result_title)
+                out["owner_first"], out["owner_last"] = first, last
+                name_str = f"{first} {last}" if first != NO_INFO else "(name not parsed)"
+                print(f"    [linkedin] Owner ({title}): {name_str} — {out['owner_linkedin_url']}")
                 break
         if out["owner_linkedin_url"] != NO_INFO:
             break
@@ -665,7 +713,14 @@ def process_brands(brands: list, output_file: str = "results.json") -> list:
         r.owner_linkedin_url   = li["owner_linkedin_url"]
         r.owner_linkedin_title = li["owner_linkedin_title"]
 
-        # 6. Prospeo — verify owner + get email
+        # Owner name priority: USPTO person → LinkedIn profile name.
+        # The LinkedIn name is trusted over a domain/company guess from Prospeo.
+        if r.trademark_owner_first_name == NO_INFO and li["owner_first"] != NO_INFO:
+            r.trademark_owner_first_name = li["owner_first"]
+            r.trademark_owner_last_name  = li["owner_last"]
+            r.notes = (r.notes + "; owner name via LinkedIn").lstrip("; ")
+
+        # 6. Prospeo — verify owner + get email (use the name we trust)
         print(f"  STEP 6: Prospeo enrichment")
         delay(1, 2)
         pe = prospeo_enrich(
@@ -675,7 +730,7 @@ def process_brands(brands: list, output_file: str = "results.json") -> list:
             r.owner_linkedin_url,
         )
         r.owner_email_prospeo = pe["owner_email_prospeo"]
-        # Backfill owner name from Prospeo if USPTO found none
+        # Backfill owner name from Prospeo ONLY if still unknown
         if r.trademark_owner_first_name == NO_INFO and pe["found_first"] != NO_INFO:
             r.trademark_owner_first_name = pe["found_first"]
             r.trademark_owner_last_name  = pe["found_last"]
