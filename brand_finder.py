@@ -458,40 +458,96 @@ def _prospeo_post(path: str, body: dict) -> Optional[dict]:
         return None
 
 
-def prospeo_enrich_owner(first: str, last: str, company: str) -> dict:
+# Owner-type titles used when searching Prospeo by company/brand
+OWNER_TITLES = ["Founder", "Owner", "Co-Founder", "Co-Owner", "President", "CEO"]
+
+
+def _domain_from_url(url: str) -> str:
+    d = re.sub(r'https?://(www\.)?', '', url)
+    return d.split('/')[0].split('?')[0].lower()
+
+
+def _prospeo_pick_person(people: list) -> Optional[dict]:
+    """Prefer a person whose current title is owner-type; else take the first."""
+    for person in people:
+        p = person.get("person", person)
+        title = (p.get("current_job_title") or "").lower()
+        if any(t.lower() in title for t in OWNER_TITLES):
+            return p
+    if people:
+        return people[0].get("person", people[0])
+    return None
+
+
+def prospeo_enrich_owner(first: str, last: str, company: str,
+                         website: str, brand: str) -> dict:
     """
-    Search Prospeo for the owner by name, then enrich for email + LinkedIn.
-    Only called when we have a real owner first + last name.
+    Find the owner on Prospeo and enrich for LinkedIn + email.
+    Search strategies, in priority order:
+      1. By owner name (from USPTO), optionally scoped to the company
+      2. By the official website's domain, filtered to owner-type titles
+      3. By the brand name (as company), filtered to owner-type titles
+    Returns found_first/found_last so the caller can backfill the owner name
+    when USPTO didn't provide one.
     """
-    out = {"owner_linkedin_url": NO_INFO, "owner_email_prospeo": NO_INFO}
-
-    if first == NO_INFO or last == NO_INFO:
-        return out
-
-    full_name = f"{first} {last}"
-
-    # Search for the person by name (+ company hint if available)
-    search_body: dict = {
-        "page": 1,
-        "filters": {"person_name": {"include": [full_name]}},
+    out = {
+        "owner_linkedin_url": NO_INFO,
+        "owner_email_prospeo": NO_INFO,
+        "found_first": NO_INFO,
+        "found_last": NO_INFO,
     }
-    if company and company != NO_INFO:
-        search_body["filters"]["company"] = {"names": {"include": [company]}}
 
-    data = _prospeo_post("/search-person", search_body)
-    if not data:
-        # Retry without company filter
+    person = None
+
+    # Strategy 1: by owner name
+    if first != NO_INFO and last != NO_INFO:
+        full_name = f"{first} {last}"
+        body: dict = {"page": 1, "filters": {"person_name": {"include": [full_name]}}}
+        if company and company != NO_INFO:
+            body["filters"]["company"] = {"names": {"include": [company]}}
+        data = _prospeo_post("/search-person", body)
+        if not data:
+            data = _prospeo_post("/search-person", {
+                "page": 1, "filters": {"person_name": {"include": [full_name]}},
+            })
+        person = _prospeo_pick_person((data or {}).get("results") or [])
+        if person:
+            print(f"    [prospeo] Matched by owner name: {full_name}")
+
+    # Strategy 2: by the official website's domain
+    if not person and website and website != NO_INFO:
+        domain = _domain_from_url(website)
+        print(f"    [prospeo] Searching by website domain: {domain}")
         data = _prospeo_post("/search-person", {
             "page": 1,
-            "filters": {"person_name": {"include": [full_name]}},
+            "filters": {
+                "company": {"domains": {"include": [domain]}},
+                "person_job_title": {"include": OWNER_TITLES},
+            },
         })
+        person = _prospeo_pick_person((data or {}).get("results") or [])
 
-    people = (data or {}).get("results") or []
-    if not people:
-        print(f"    [prospeo] No person found for {full_name}")
+    # Strategy 3: by brand name as company
+    if not person and brand:
+        print(f"    [prospeo] Searching by brand name: {brand}")
+        data = _prospeo_post("/search-person", {
+            "page": 1,
+            "filters": {
+                "company": {"names": {"include": [brand]}},
+                "person_job_title": {"include": OWNER_TITLES},
+            },
+        })
+        person = _prospeo_pick_person((data or {}).get("results") or [])
+
+    if not person:
+        print(f"    [prospeo] No person found")
         return out
 
-    person = people[0].get("person", people[0])
+    out["found_first"] = person.get("first_name") or NO_INFO
+    out["found_last"] = person.get("last_name") or NO_INFO
+    found_name = person.get("full_name") or f"{out['found_first']} {out['found_last']}"
+    print(f"    [prospeo] Person: {found_name}")
+
     linkedin = person.get("linkedin_url") or ""
     person_id = person.get("person_id") or ""
 
@@ -592,19 +648,28 @@ def process_brands(brands: list, output_file: str = "results.json") -> list:
         r.trademark_owner_last_name  = tm["trademark_owner_last_name"]
         r.trademark_owner_email      = tm["trademark_owner_email"]
 
-        # ── 5. Prospeo (only if we have a real owner name) ─────────
-        if r.trademark_owner_first_name != NO_INFO:
+        # ── 5. Prospeo: by owner name → website domain → brand ─────
+        if (r.trademark_owner_first_name != NO_INFO
+                or r.official_website != NO_INFO
+                or brand):
             print(f"  STEP 5: Prospeo enrichment")
             delay(1, 2)
             pe = prospeo_enrich_owner(
                 r.trademark_owner_first_name,
                 r.trademark_owner_last_name,
                 biz,
+                r.official_website,
+                brand,
             )
-            r.owner_linkedin_url   = pe["owner_linkedin_url"]
-            r.owner_email_prospeo  = pe["owner_email_prospeo"]
+            r.owner_linkedin_url  = pe["owner_linkedin_url"]
+            r.owner_email_prospeo = pe["owner_email_prospeo"]
+            # Backfill the owner name from Prospeo when USPTO found none
+            if r.trademark_owner_first_name == NO_INFO and pe["found_first"] != NO_INFO:
+                r.trademark_owner_first_name = pe["found_first"]
+                r.trademark_owner_last_name  = pe["found_last"]
+                r.notes = (r.notes + "; owner name via Prospeo").strip("; ")
         else:
-            print(f"  STEP 5: Skipping Prospeo (no owner name found — saving credits)")
+            print(f"  STEP 5: Skipping Prospeo (no name, website, or brand)")
 
         results.append(r)
         save_results(results, output_file)
