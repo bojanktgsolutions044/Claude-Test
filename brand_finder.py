@@ -155,6 +155,40 @@ def _amazon_product_urls(brand: str) -> list:
     return urls[:10]
 
 
+def _similar(a: str, b: str) -> bool:
+    """True if two names overlap by slug (one contained in the other)."""
+    sa, sb = _slug(a), _slug(b)
+    if not sa or not sb:
+        return False
+    return sa in sb or sb in sa
+
+
+def _parse_brand_byline(html: str) -> str:
+    """
+    Read the product's BRAND from the Amazon byline, e.g.
+      'Visit the Americanflat Store'  →  Americanflat
+      'Brand: Americanflat'           →  Americanflat
+    Returns '' if no byline present.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    el = soup.select_one("#bylineInfo, #brand, a#bylineInfo")
+    if el:
+        t = el.get_text(" ", strip=True)
+        m = re.search(r'Visit the (.+?) Store', t, re.I)
+        if m:
+            return m.group(1).strip()
+        m = re.search(r'Brand:\s*(.+)', t, re.I)
+        if m:
+            return m.group(1).strip()
+        if t and "store" not in t.lower():
+            return t.strip()
+    # Fallback: "Brand <name>" inside the product detail table
+    m = re.search(r'<th[^>]*>\s*Brand\s*</th>\s*<td[^>]*>\s*<span[^>]*>([^<]{2,40})</span>', html, re.I)
+    if m:
+        return m.group(1).strip()
+    return ""
+
+
 def _parse_sold_by(html: str) -> tuple:
     """
     Extract (seller_name, seller_page_url) from an Amazon product page.
@@ -229,10 +263,9 @@ def amazon_get_seller_info(brand: str) -> dict:
         print(f"    [amazon] No listings found via DDG")
         return out
 
-    print(f"    [amazon] Found {len(product_urls)} candidate listings, trying each...")
+    print(f"    [amazon] Found {len(product_urls)} candidate listings, verifying brand...")
 
     for product_url in product_urls:
-        out["amazon_product_url"] = product_url
         print(f"    [amazon] → {product_url[:75]}...")
         delay(2, 4)
         resp = safe_get(product_url)
@@ -240,13 +273,25 @@ def amazon_get_seller_info(brand: str) -> dict:
             print(f"    [amazon]   Blocked/failed, skipping")
             continue
 
+        # VERIFY this product actually belongs to the brand (byline brand check)
+        product_brand = _parse_brand_byline(resp.text)
+        if product_brand:
+            if not _similar(product_brand, brand):
+                print(f"    [amazon]   Brand mismatch (listing brand: '{product_brand}'), skipping")
+                continue
+            print(f"    [amazon]   Brand verified: {product_brand}")
+        else:
+            print(f"    [amazon]   No brand byline found, skipping (can't verify)")
+            continue
+
         seller_name, seller_page_url = _parse_sold_by(resp.text)
         if not seller_name:
             print(f"    [amazon]   No 'Sold by' found, trying next listing")
             continue
 
-        print(f"    [amazon]   Sold by: {seller_name}")
+        out["amazon_product_url"] = product_url
         out["amazon_seller_name"] = seller_name
+        print(f"    [amazon]   Sold by: {seller_name}")
 
         if seller_page_url:
             delay(2, 3)
@@ -260,7 +305,10 @@ def amazon_get_seller_info(brand: str) -> dict:
                 if biz_addr:
                     out["amazon_seller_address"] = biz_addr
                     print(f"    [amazon]   Business Addr : {biz_addr[:60]}...")
-        break  # Got seller — stop iterating
+        break  # Got a brand-verified seller — stop
+
+    if out["amazon_seller_name"] == NO_INFO:
+        print(f"    [amazon] No brand-verified listing found")
 
     return out
 
@@ -283,10 +331,26 @@ def _slug(s: str) -> str:
     return re.sub(r'[^a-z0-9]', '', s.lower())
 
 
+def _page_mentions(url: str, terms: list) -> Optional[bool]:
+    """
+    Fetch a homepage and check whether it mentions any of the terms.
+    Returns True/False, or None if the page couldn't be fetched.
+    """
+    resp = safe_get(url, timeout=10)
+    if not resp:
+        return None
+    page_slug = _slug(BeautifulSoup(resp.text, "lxml").get_text(" "))
+    for t in terms:
+        if t and t != NO_INFO and _slug(t) and _slug(t) in page_slug:
+            return True
+    return False
+
+
 def find_official_website(brand: str, business_name: str) -> str:
     """
-    Prefer the domain that actually matches the brand name (e.g. Americanflat
-    → americanflat.com). Only fall back to Claude when no domain clearly matches.
+    Find the brand's OWN homepage. A candidate is only accepted if its homepage
+    actually mentions the brand or business name — this prevents picking
+    look-alike domains (e.g. skysports.com for 'Amy Sport').
     """
     candidates = []
     search_names = list(dict.fromkeys(x for x in [brand, business_name] if x and x != NO_INFO))
@@ -297,9 +361,9 @@ def find_official_website(brand: str, business_name: str) -> str:
                 url = h.get("href", "")
                 if url and not any(s in url for s in SKIP_SITE_DOMAINS):
                     candidates.append(homepage(url))
-            if len(candidates) >= 4:
+            if len(candidates) >= 6:
                 break
-        if len(candidates) >= 4:
+        if len(candidates) >= 6:
             break
 
     if not candidates:
@@ -310,29 +374,38 @@ def find_official_website(brand: str, business_name: str) -> str:
         if c not in seen:
             seen.add(c); unique.append(c)
 
-    # 1) Strong match: a domain whose name contains the brand slug → use directly
+    terms = search_names
     brand_slug = _slug(brand)
-    for u in unique:
-        domain_slug = _slug(_domain_from_url(u).split(".")[0])
-        if brand_slug and (brand_slug in domain_slug or domain_slug in brand_slug):
-            print(f"    [website] Brand-matched domain: {u}")
+    biz_slug = _slug(business_name) if business_name and business_name != NO_INFO else ""
+
+    # Rank: domains whose name matches the brand/business slug come first
+    def rank(u):
+        dslug = _slug(_domain_from_url(u).split(".")[0])
+        if brand_slug and (brand_slug in dslug or dslug in brand_slug):
+            return 0
+        if biz_slug and (biz_slug in dslug or dslug in biz_slug):
+            return 1
+        return 2
+    ordered = sorted(unique, key=rank)
+
+    # Accept the first candidate whose homepage actually mentions the brand/biz
+    fallback = None
+    for u in ordered[:6]:
+        verified = _page_mentions(u, terms)
+        if verified is True:
+            print(f"    [website] Verified (mentions brand): {u}")
             return u
+        if verified is None and fallback is None and rank(u) == 0:
+            fallback = u  # couldn't fetch, but domain strongly matches brand
+        delay(1, 2)
 
-    # 2) Otherwise let Claude pick from the candidates
-    best = unique[0]
-    if HAS_CLAUDE and len(unique) > 1:
-        names_str = " / ".join(search_names)
-        options = "\n".join(f"{i+1}. {u}" for i, u in enumerate(unique[:5]))
-        answer = claude_ask(
-            f'Brand: "{names_str}"\nCandidate homepages:\n{options}\n\n'
-            f'Which is the brand\'s OWN official homepage (not a directory, '
-            f'data-broker, or marketplace)? Reply with ONLY the URL. '
-            f'If none are correct, reply: No Info'
-        )
-        if answer.startswith("http"):
-            best = homepage(answer)
+    # Nothing verified by content. Only fall back to a strong brand-slug domain.
+    if fallback:
+        print(f"    [website] Unverified but brand-matched domain: {fallback}")
+        return fallback
 
-    return best or NO_INFO
+    print(f"    [website] No homepage could be verified for this brand")
+    return NO_INFO
 
 
 # ── STEP 3: Contact info ──────────────────────────────────────────────────────
