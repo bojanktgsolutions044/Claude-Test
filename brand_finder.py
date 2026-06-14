@@ -156,64 +156,103 @@ def prospeo_domain_search(domain: str) -> dict:
         "Content-Type": "application/json",
         "X-KEY": PROSPEO_API_KEY,
     }
-    payload = {
-        "domain": domain,
-        "limit": 50,  # get more results so we can filter by title
-    }
+    # Try both payload formats Prospeo supports
+    payloads_to_try = [
+        {"url": domain},
+        {"domain": domain},
+        {"url": domain, "limit": 50},
+        {"domain": domain, "limit": 50},
+    ]
 
-    try:
-        resp = requests.post(
-            f"{PROSPEO_API_URL}/domain-search",
-            headers=headers,
-            json=payload,
-            timeout=15
-        )
-        data = resp.json()
+    data = None
+    for payload in payloads_to_try:
+        try:
+            resp = requests.post(
+                f"{PROSPEO_API_URL}/domain-search",
+                headers=headers,
+                json=payload,
+                timeout=15
+            )
+            data = resp.json()
+            if resp.status_code == 200 and not data.get("error"):
+                break  # success
+            else:
+                print(f"  [prospeo] Trying next format... ({data.get('message', resp.status_code)})")
+                data = None
+        except Exception as e:
+            print(f"  [prospeo] Request failed: {e}")
+            data = None
 
-        if resp.status_code != 200 or data.get("error"):
-            print(f"  [prospeo] Error: {data.get('message', resp.status_code)}")
-            return {}
+    if not data:
+        # Last resort: print raw response for debugging
+        try:
+            resp = requests.post(
+                f"{PROSPEO_API_URL}/domain-search",
+                headers=headers,
+                json={"url": domain},
+                timeout=15
+            )
+            print(f"  [prospeo] Raw response ({resp.status_code}): {resp.text[:300]}")
+        except Exception:
+            pass
+        return {}
 
-        response = data.get("response", {})
+    response = data.get("response", {})
 
-        # Extract verified company name
-        company_info = response.get("company", {})
-        company_name = (
-            company_info.get("name") or
-            company_info.get("organization") or
+    # Extract verified company name
+    company_info = response.get("company", {})
+    company_name = (
+        company_info.get("name") or
+        company_info.get("organization") or
+        response.get("organization") or
+        ""
+    )
+
+    # Extract all people, filter by target job titles
+    email_list = (
+        response.get("emails") or
+        response.get("people") or
+        response.get("contacts") or
+        []
+    )
+    matched_contacts = []
+    all_emails = []
+
+    for person in email_list:
+        email = person.get("email", "")
+        title = (
+            person.get("position") or
+            person.get("title") or
+            person.get("job_title") or
             ""
         )
+        first = person.get("first_name", "") or person.get("firstName", "")
+        last = person.get("last_name", "") or person.get("lastName", "")
+        linkedin = (
+            person.get("linkedin") or
+            person.get("linkedin_url") or
+            person.get("linkedin_profile") or
+            ""
+        )
+        full_name = f"{first} {last}".strip() or person.get("name", "")
 
-        # Extract all people, filter by target job titles
-        email_list = response.get("emails", [])
-        matched_contacts = []
-        all_emails = []
+        if email:
+            all_emails.append(email)
 
-        for person in email_list:
-            email = person.get("email", "")
-            title = person.get("position") or person.get("title") or ""
-            first = person.get("first_name", "")
-            last = person.get("last_name", "")
-            linkedin = person.get("linkedin") or person.get("linkedin_url") or ""
-            full_name = f"{first} {last}".strip()
+        if title and is_target_title(title):
+            matched_contacts.append(Contact(
+                name=full_name,
+                title=title,
+                email=email,
+                linkedin=linkedin,
+            ))
 
-            if email:
-                all_emails.append(email)
-
-            if title and is_target_title(title):
-                matched_contacts.append(Contact(
-                    name=full_name,
-                    title=title,
-                    email=email,
-                    linkedin=linkedin,
-                ))
-
-        return {
-            "company_name": company_name,
-            "matched_contacts": matched_contacts,
-            "all_emails": all_emails,
-            "total": response.get("total", 0),
-        }
+    return {
+        "company_name": company_name,
+        "matched_contacts": matched_contacts,
+        "all_emails": all_emails,
+        "total": response.get("total", len(email_list)),
+    }
 
     except Exception as e:
         print(f"  [prospeo] Request failed: {e}")
