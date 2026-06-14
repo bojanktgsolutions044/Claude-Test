@@ -142,6 +142,38 @@ def page_keyword_score(url: str, keywords: list) -> int:
     return sum(1 for kw in keywords if kw in text)
 
 
+# Signals that a website is actually selling products (e-commerce store)
+ECOMMERCE_SIGNALS = [
+    "add to cart", "add to bag", "buy now", "shop now", "checkout",
+    "in stock", "out of stock", "free shipping", "view cart",
+    "add_to_cart", "shopify", "woocommerce", "product", "shop",
+]
+
+
+def website_sells_products(url: str, product_keywords: list) -> tuple:
+    """
+    Check if a website is an active e-commerce store selling the right products.
+    Returns (has_store: bool, product_score: int).
+    """
+    if not HAS_REQUESTS:
+        return False, 0
+    try:
+        resp = requests.get(url, headers=amazon_headers(), timeout=12)
+        if resp.status_code != 200:
+            return False, 0
+    except Exception:
+        return False, 0
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    text = soup.get_text(" ", strip=True).lower()
+    html = resp.text.lower()
+
+    # Check for e-commerce signals in text or HTML
+    has_store = any(signal in text or signal in html for signal in ECOMMERCE_SIGNALS)
+    product_score = sum(1 for kw in product_keywords if kw in text)
+    return has_store, product_score
+
+
 def find_official_website(brand_name: str) -> str:
     skip_domains = [
         "amazon.", "wikipedia.", "facebook.", "instagram.",
@@ -262,20 +294,30 @@ def find_official_website(brand_name: str) -> str:
             score -= 8
         return score
 
-    # Score each candidate: domain relevance is primary, product-type match
-    # (does the site actually sell what the brand sells on Amazon?) breaks ties.
+    # Score each candidate: check if it's an actual product-selling store,
+    # then rank by domain relevance and product category match.
     scored = []
     for url, domain in candidates:
         home = homepage_of(url)
+        has_store, p_score = website_sells_products(home, product_keywords)
         d_score = domain_score(domain)
-        p_score = page_keyword_score(home, product_keywords)
+        status = "has store" if has_store else "no store"
         if product_keywords:
-            print(f"    candidate {home}  (domain {d_score}, product match {p_score})")
+            print(f"    candidate {home}  (domain {d_score}, product match {p_score}, {status})")
+        # Only accept sites that are actual e-commerce stores selling related products.
+        # If product keywords exist, require at least 1 keyword match.
+        if not has_store:
+            continue
+        if product_keywords and p_score == 0:
+            continue
         scored.append((d_score, p_score, home, domain))
         random_delay(1, 2)
 
+    if not scored:
+        return ""  # will display as "No Website"
+
     # Deterministic ranking: domain score, then product match, then prefer
-    # .com, then shorter domain, then alphabetical — so runs are consistent.
+    # .com, then shorter domain — so runs are consistent.
     scored.sort(key=lambda c: (
         c[0],                       # domain score
         min(c[1], 4),               # product match (capped so it can't dominate)
@@ -545,7 +587,7 @@ def print_summary(results: list):
     for r in results:
         print(f"\nBrand           : {r.input_brand}")
         print(f"  Amazon search : {r.amazon_search_url}")
-        print(f"  Official site : {r.official_website or 'not found'}")
+        print(f"  Official site : {r.official_website or 'No Website'}")
         if r.seller_business_name:
             print(f"  Business name : {r.seller_business_name}")
         if r.seller_business_address:
