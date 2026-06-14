@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 """
-Brand Finder: Given a list of brand names, finds their official website,
-verifies company name via Prospeo, and extracts key contacts by job title.
+Brand Finder — full enrichment pipeline:
+  1. Amazon: find organic listing → seller page → Business Name + Address
+  2. Official website: homepage only, verified via Claude
+  3. Contact: email or contact-form URL from the official site
+  4. USPTO: search by Business Name → owner first/last name
+  5. Prospeo: owner name → LinkedIn URL + email
 """
 
-import time
-import json
-import re
-import random
-import sys
-import argparse
-import csv
-import os
-from dataclasses import dataclass, asdict, field
-from typing import Optional, List
+import time, json, re, random, sys, argparse, csv, os
+from dataclasses import dataclass, asdict
+from typing import Optional
 import warnings
 warnings.filterwarnings("ignore")
 
 import requests
+from bs4 import BeautifulSoup
 
 try:
     from ddgs import DDGS
@@ -25,8 +23,7 @@ except ImportError:
     try:
         from duckduckgo_search import DDGS
     except ImportError:
-        print("ERROR: Run this first:  pip3 install ddgs")
-        sys.exit(1)
+        print("ERROR: pip3 install ddgs"); sys.exit(1)
 
 try:
     import anthropic
@@ -34,314 +31,526 @@ try:
 except ImportError:
     HAS_CLAUDE = False
 
+# ── API keys ────────────────────────────────────────────────────────────────
 PROSPEO_API_KEY = os.environ.get(
     "PROSPEO_API_KEY",
     "pk_bf9cf188bea22288c22a10c7edaf1081da0d95208706531dac27ef0ca9c9ceb1"
 )
-PROSPEO_API_URL = "https://api.prospeo.io"
+PROSPEO_URL = "https://api.prospeo.io"
 
-# Job titles to extract from Prospeo results
-TARGET_TITLES = [
-    "founder", "owner", "co-founder", "cofounder",
-    "president", "co-owner", "coowner",
-    "vp of marketing", "vp marketing", "vice president of marketing",
-    "marketing director", "director of marketing",
-]
+NO_INFO = "No Info"
 
-
-@dataclass
-class Contact:
-    name: str = ""
-    title: str = ""
-    email: str = ""
-    linkedin: str = ""
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
 
+# ── Data model ───────────────────────────────────────────────────────────────
 @dataclass
 class BrandResult:
     input_brand: str
-    amazon_search_url: str = ""
-    official_website: Optional[str] = None
-    verified_company_name: Optional[str] = None
-    # Key contacts matching target job titles
-    contact_1_name: str = ""
-    contact_1_title: str = ""
-    contact_1_email: str = ""
-    contact_1_linkedin: str = ""
-    contact_2_name: str = ""
-    contact_2_title: str = ""
-    contact_2_email: str = ""
-    contact_2_linkedin: str = ""
-    contact_3_name: str = ""
-    contact_3_title: str = ""
-    contact_3_email: str = ""
-    contact_3_linkedin: str = ""
-    all_matched_contacts: str = ""  # summary of all matches beyond 3
-    confidence: str = "low"
+    # Amazon
+    amazon_search_url: str = NO_INFO
+    amazon_product_url: str = NO_INFO
+    amazon_seller_name: str = NO_INFO
+    amazon_seller_address: str = NO_INFO
+    # Official website
+    official_website: str = NO_INFO
+    # Contact
+    contact_email: str = NO_INFO
+    contact_form_url: str = NO_INFO
+    # USPTO
+    trademark_owner_first_name: str = NO_INFO
+    trademark_owner_last_name: str = NO_INFO
+    trademark_owner_email: str = NO_INFO
+    # Prospeo / LinkedIn
+    owner_linkedin_url: str = NO_INFO
+    owner_email_prospeo: str = NO_INFO
+    # Meta
     notes: str = ""
 
 
-def random_delay(min_s=2.0, max_s=5.0):
-    time.sleep(random.uniform(min_s, max_s))
+# ── Helpers ──────────────────────────────────────────────────────────────────
+def delay(a=2.0, b=5.0):
+    time.sleep(random.uniform(a, b))
 
 
-def make_amazon_url(brand_name: str) -> str:
-    query = brand_name.strip().replace(" ", "+")
-    return f"https://www.amazon.com/s?k={query}"
+def homepage(url: str) -> str:
+    """Strip path/query from a URL and return only the root homepage."""
+    m = re.match(r'(https?://[^/]+)', url)
+    return m.group(1) if m else url
 
 
-def extract_domain(url: str) -> str:
-    domain = re.sub(r'https?://(www\.)?', '', url)
-    return domain.split('/')[0].split('?')[0].lower()
+def safe_get(url: str, timeout: int = 12) -> Optional[requests.Response]:
+    try:
+        r = requests.get(url, headers=BROWSER_HEADERS, timeout=timeout)
+        if r.status_code == 200:
+            return r
+    except Exception:
+        pass
+    return None
 
 
-def find_official_website(brand_name: str) -> str:
-    skip_domains = [
-        "amazon.", "wikipedia.", "facebook.", "instagram.",
-        "twitter.", "linkedin.", "yelp.", "reddit.", "youtube.",
-        "tiktok.", "pinterest.", "walmart.", "ebay."
+def ddg(query: str, n: int = 8) -> list:
+    try:
+        with DDGS() as d:
+            return list(d.text(query, max_results=n))
+    except Exception as e:
+        print(f"    [ddg] {e}")
+        delay(3, 6)
+        return []
+
+
+def claude(prompt: str, max_tokens: int = 300) -> str:
+    """Call Claude Haiku; return the text or empty string."""
+    if not HAS_CLAUDE:
+        return ""
+    try:
+        client = anthropic.Anthropic()
+        resp = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        print(f"    [claude] {e}")
+        return ""
+
+
+# ── STEP 1: Amazon ────────────────────────────────────────────────────────────
+def _amazon_organic_urls(brand: str) -> list[str]:
+    """
+    Use DDG to find real Amazon product listing URLs for this brand.
+    DDG bypasses Amazon's bot-detection on the search page.
+    """
+    hits = ddg(f'site:amazon.com/dp "{brand}"', n=10)
+    urls = []
+    for h in hits:
+        u = h.get("href", "")
+        if "amazon.com" in u and "/dp/" in u:
+            urls.append(u)
+    return urls
+
+
+def _parse_sold_by(html: str) -> tuple[str, str]:
+    """
+    From an Amazon product page, return (seller_name, seller_page_url).
+    seller_page_url is the link we follow to get Detailed Seller Information.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    # Approach 1: #sellerProfileTriggerId link
+    tag = soup.select_one("#sellerProfileTriggerId")
+    if tag:
+        name = tag.get_text(strip=True)
+        href = tag.get("href", "")
+        if href and name and "Amazon" not in name:
+            url = ("https://www.amazon.com" + href) if href.startswith("/") else href
+            return name, url
+
+    # Approach 2: merchant-info section
+    for a in soup.select("#merchantInfoFeature_feature_div a, #tabular-buybox a"):
+        name = a.get_text(strip=True)
+        href = a.get("href", "")
+        if name and "Amazon" not in name and href:
+            url = ("https://www.amazon.com" + href) if href.startswith("/") else href
+            return name, url
+
+    # Approach 3: regex on raw HTML
+    m = re.search(r'[Ss]old by[:\s]*<[^>]+>([^<]{2,60})</a>', html)
+    if m:
+        return m.group(1).strip(), ""
+
+    return "", ""
+
+
+def _parse_seller_page(html: str) -> tuple[str, str]:
+    """
+    From the Amazon seller storefront page, extract Business Name + Address
+    from the 'Detailed Seller Information' section.
+    Returns (business_name, business_address).
+    """
+    soup = BeautifulSoup(html, "lxml")
+    business_name = ""
+    address_lines = []
+
+    # The section is usually a <ul> or <div> with these labels
+    text = soup.get_text("\n")
+    bn = re.search(r'Business Name[:\s]*([^\n]{2,80})', text)
+    if bn:
+        business_name = bn.group(1).strip()
+
+    ba = re.search(
+        r'Business Address[:\s]*\n((?:[^\n]+\n){1,6})',
+        text
+    )
+    if ba:
+        lines = [l.strip() for l in ba.group(1).splitlines() if l.strip()]
+        address_lines = lines
+
+    return business_name, "\n".join(address_lines)
+
+
+def amazon_get_seller_info(brand: str) -> dict:
+    """Full Amazon flow: search → product page → seller page → business info."""
+    out = {
+        "amazon_search_url": f"https://www.amazon.com/s?k={brand.replace(' ', '+')}",
+        "amazon_product_url": NO_INFO,
+        "amazon_seller_name": NO_INFO,
+        "amazon_seller_address": NO_INFO,
+    }
+
+    product_urls = _amazon_organic_urls(brand)
+    if not product_urls:
+        print(f"    [amazon] No product listings found via DDG")
+        return out
+
+    for product_url in product_urls[:3]:
+        out["amazon_product_url"] = product_url
+        print(f"    [amazon] Fetching product: {product_url[:70]}...")
+        delay(2, 4)
+        resp = safe_get(product_url)
+        if not resp:
+            print(f"    [amazon] Blocked / failed")
+            continue
+
+        seller_name, seller_page_url = _parse_sold_by(resp.text)
+        if not seller_name:
+            print(f"    [amazon] Could not find 'Sold by' on this listing, trying next")
+            continue
+
+        print(f"    [amazon] Sold by: {seller_name}")
+        out["amazon_seller_name"] = seller_name
+
+        if seller_page_url:
+            delay(2, 3)
+            print(f"    [amazon] Fetching seller page...")
+            seller_resp = safe_get(seller_page_url)
+            if seller_resp:
+                biz_name, biz_addr = _parse_seller_page(seller_resp.text)
+                if biz_name:
+                    out["amazon_seller_name"] = biz_name
+                    print(f"    [amazon] Business Name: {biz_name}")
+                if biz_addr:
+                    out["amazon_seller_address"] = biz_addr
+                    print(f"    [amazon] Address found")
+        break
+
+    return out
+
+
+# ── STEP 2: Official website ──────────────────────────────────────────────────
+def find_official_website(brand: str, business_name: str) -> str:
+    """
+    Search DDG with brand name and/or business name.
+    Return ONLY the homepage (root domain), validated by Claude if available.
+    Skip Amazon, social media, and marketplace results.
+    """
+    skip = [
+        "amazon.", "wikipedia.", "facebook.", "instagram.", "twitter.",
+        "linkedin.", "yelp.", "reddit.", "youtube.", "tiktok.",
+        "pinterest.", "walmart.", "ebay.", "etsy.", "shopify."
     ]
-    queries = [
-        f"{brand_name} official website",
-        f"{brand_name} homepage -wikipedia -amazon",
+    candidates = []
+    search_names = list(dict.fromkeys(filter(None, [brand, business_name])))
+
+    for name in search_names:
+        for q in [f'"{name}" official website', f'"{name}" site homepage']:
+            for h in ddg(q, n=8):
+                url = h.get("href", "")
+                if url and not any(s in url for s in skip):
+                    candidates.append(homepage(url))
+            if candidates:
+                break
+        if candidates:
+            break
+
+    if not candidates:
+        return NO_INFO
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+
+    best = unique[0]
+
+    # Ask Claude to pick the right one and confirm it's a homepage
+    if HAS_CLAUDE and unique:
+        names_str = " / ".join(search_names)
+        options = "\n".join(f"{i+1}. {u}" for i, u in enumerate(unique[:5]))
+        answer = claude(
+            f'Brand: "{names_str}"\n'
+            f'These are candidate homepages found online:\n{options}\n\n'
+            f'Which URL is the correct official brand homepage that sells the same '
+            f'products as the brand? Reply with ONLY the URL (e.g. https://example.com). '
+            f'If none look correct, reply: No Info'
+        )
+        if answer.startswith("http"):
+            best = homepage(answer)
+
+    return best if best else NO_INFO
+
+
+# ── STEP 3: Contact info from official website ────────────────────────────────
+def find_contact_info(website_url: str) -> tuple[str, str]:
+    """
+    Try common contact page paths. Extract email address or contact form URL.
+    Returns (email, form_url) — either/both may be NO_INFO.
+    """
+    if website_url == NO_INFO:
+        return NO_INFO, NO_INFO
+
+    base = website_url.rstrip("/")
+    contact_paths = [
+        "/contact", "/contact-us", "/pages/contact", "/pages/contact-us",
+        "/support", "/help", "/about/contact",
     ]
-    for query in queries:
+
+    email_re = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
+    skip_emails = {"example.com", "sentry.io", "schema.org", "w3.org"}
+
+    found_email = NO_INFO
+    found_form = NO_INFO
+
+    for path in contact_paths:
+        url = base + path
+        resp = safe_get(url)
+        if not resp:
+            continue
+
+        # Look for an email address
+        emails = email_re.findall(resp.text)
+        for em in emails:
+            domain = em.split("@")[-1].lower()
+            if domain not in skip_emails and not em.endswith(".png"):
+                found_email = em
+                print(f"    [contact] Email: {em}")
+                break
+
+        # Look for a <form> on the page (contact form)
+        if found_email == NO_INFO:
+            soup = BeautifulSoup(resp.text, "lxml")
+            if soup.find("form"):
+                found_form = url
+                print(f"    [contact] Form: {url}")
+
+        if found_email != NO_INFO or found_form != NO_INFO:
+            break
+
+        delay(1, 2)
+
+    return found_email, found_form
+
+
+# ── STEP 4: USPTO trademark owner ────────────────────────────────────────────
+def uspto_find_owner(brand: str, business_name: str) -> dict:
+    """
+    Query the free USPTO EFTS API. Search by business name first, then brand.
+    Extract owner first name + last name.
+    USPTO does NOT expose personal emails — that field always returns No Info.
+    """
+    out = {
+        "trademark_owner_first_name": NO_INFO,
+        "trademark_owner_last_name": NO_INFO,
+        "trademark_owner_email": NO_INFO,
+    }
+
+    search_terms = list(dict.fromkeys(filter(None, [business_name, brand])))
+
+    for term in search_terms:
+        if term == NO_INFO:
+            continue
         try:
-            with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=8))
-        except Exception as e:
-            print(f"  [search error] {e}")
-            random_delay(3, 6)
-            continue
-
-        if not results:
-            random_delay(2, 4)
-            continue
-
-        brand_slug = re.sub(r'[^a-z0-9]', '', brand_name.lower())
-        for r in results:
-            url = r.get("href", "")
-            if not url or any(d in url for d in skip_domains):
+            resp = requests.get(
+                "https://efts.uspto.gov/LATEST/search-efts",
+                params={"q": f'"{term}"', "df": "mark_identification", "f": "json"},
+                headers=BROWSER_HEADERS,
+                timeout=15,
+            )
+            if resp.status_code != 200:
                 continue
-            domain = re.sub(r'https?://(www\.)?', '', url).split('/')[0]
-            domain_clean = re.sub(r'[^a-z0-9]', '', domain.lower())
-            if brand_slug in domain_clean:
-                return url
-        for r in results:
-            url = r.get("href", "")
-            if url and not any(d in url for d in skip_domains):
-                return url
-        random_delay(2, 3)
-    return ""
+            hits = (resp.json().get("hits") or {}).get("hits") or []
+        except Exception as e:
+            print(f"    [uspto] {e}")
+            continue
+
+        if not hits:
+            continue
+
+        source = hits[0].get("_source", {})
+        owner_raw = source.get("owner") or ""
+        if isinstance(owner_raw, list):
+            owner_raw = owner_raw[0] if owner_raw else {}
+        if isinstance(owner_raw, dict):
+            owner_str = (
+                owner_raw.get("owner_name") or
+                owner_raw.get("party_name") or
+                owner_raw.get("name") or ""
+            )
+        else:
+            owner_str = str(owner_raw)
+
+        owner_str = owner_str.strip()
+        if not owner_str:
+            continue
+
+        print(f"    [uspto] Owner entity: {owner_str}")
+
+        # Ask Claude whether this is a person's name and split it
+        if HAS_CLAUDE:
+            answer = claude(
+                f'Trademark owner string: "{owner_str}"\n\n'
+                f'If this is a real person\'s full name (not a company/LLC/Inc/Ltd/Corp/FZE), '
+                f'reply with JSON: {{"first": "First", "last": "Last"}}\n'
+                f'If it is a company name, reply with exactly: COMPANY'
+            )
+            if answer.startswith("{"):
+                try:
+                    parsed = json.loads(re.search(r'\{.*\}', answer, re.DOTALL).group())
+                    out["trademark_owner_first_name"] = parsed.get("first", NO_INFO) or NO_INFO
+                    out["trademark_owner_last_name"] = parsed.get("last", NO_INFO) or NO_INFO
+                    print(f"    [uspto] Owner: {out['trademark_owner_first_name']} {out['trademark_owner_last_name']}")
+                    break
+                except Exception:
+                    pass
+        # If no Claude, try a simple heuristic: no LLC/Inc/Ltd in name
+        elif not any(kw in owner_str.upper() for kw in ["LLC", "INC", "LTD", "CORP", "CO.", "FZE", "GMBH"]):
+            parts = owner_str.split()
+            if len(parts) >= 2:
+                out["trademark_owner_first_name"] = parts[0]
+                out["trademark_owner_last_name"] = " ".join(parts[1:])
+                break
+
+        # It's a company — still report entity in notes but keep names as No Info
+        break
+
+    return out
 
 
-def is_target_title(title: str) -> bool:
-    """Check if a job title matches one of our target titles."""
-    title_lower = title.lower().strip()
-    return any(t in title_lower for t in TARGET_TITLES)
-
-
-def _prospeo_headers() -> dict:
-    return {"Content-Type": "application/json", "X-KEY": PROSPEO_API_KEY}
-
-
+# ── STEP 5: Prospeo — LinkedIn + email for the owner ─────────────────────────
 def _prospeo_post(path: str, body: dict) -> Optional[dict]:
-    """POST to a Prospeo endpoint; return parsed JSON or None on failure."""
     try:
         resp = requests.post(
-            f"{PROSPEO_API_URL}{path}",
-            headers=_prospeo_headers(),
+            f"{PROSPEO_URL}{path}",
+            headers={"Content-Type": "application/json", "X-KEY": PROSPEO_API_KEY},
             json=body,
             timeout=20,
         )
         data = resp.json()
         if resp.status_code != 200 or data.get("error"):
             msg = data.get("error_toast") or data.get("message") or resp.status_code
-            print(f"  [prospeo] {path} -> {msg}")
+            print(f"    [prospeo] {path} → {msg}")
             return None
         return data
     except Exception as e:
-        print(f"  [prospeo] {path} request failed: {e}")
+        print(f"    [prospeo] {path} failed: {e}")
         return None
 
 
-def prospeo_find_company_name(domain: str, fallback_results: list) -> str:
+def prospeo_enrich_owner(first: str, last: str, company: str) -> dict:
     """
-    Verify the real company name from a website domain via /search-company.
-    Falls back to the company name on a matched person's CURRENT job.
+    Search Prospeo for the owner by name, then enrich for email + LinkedIn.
+    Only called when we have a real owner first + last name.
     """
-    # Try the documented nested filter shapes for search-company.
-    company_filter_variants = [
-        {"page": 1, "filters": {"company": {"domains": {"include": [domain]}}}},
-        {"page": 1, "filters": {"company_domain": {"include": [domain]}}},
-        {"page": 1, "filters": {"company": {"websites": {"include": [domain]}}}},
-    ]
-    for body in company_filter_variants:
-        data = _prospeo_post("/search-company", body)
-        if data:
-            results = data.get("results") or []
-            if results:
-                comp = results[0].get("company", results[0])
-                name = comp.get("name") or comp.get("company_name") or ""
-                if name:
-                    return name
-            break  # endpoint worked but no match; don't retry other shapes
+    out = {"owner_linkedin_url": NO_INFO, "owner_email_prospeo": NO_INFO}
 
-    # Fallback: take the company name from a matched person's current job.
-    for person in fallback_results:
-        p = person.get("person", person)
-        for job in p.get("job_history", []):
-            if job.get("current") and job.get("company_name"):
-                return job["company_name"]
-    return ""
+    if first == NO_INFO or last == NO_INFO:
+        return out
 
+    full_name = f"{first} {last}"
 
-def prospeo_enrich_email(person: dict) -> str:
-    """Get a verified email for a person via /enrich-person (uses LinkedIn URL)."""
-    p = person.get("person", person)
-    linkedin = p.get("linkedin_url") or ""
-    person_id = p.get("person_id") or ""
-
-    enrich_bodies = []
-    if linkedin:
-        enrich_bodies.append({"linkedin_url": linkedin})
-    if person_id:
-        enrich_bodies.append({"person_id": person_id})
-
-    for body in enrich_bodies:
-        data = _prospeo_post("/enrich-person", body)
-        if not data:
-            continue
-        resp = data.get("response", data)
-        # Email can come back as a string or as a nested object.
-        email_field = resp.get("email")
-        if isinstance(email_field, dict):
-            email = email_field.get("email") or email_field.get("value") or ""
-        else:
-            email = email_field or ""
-        if not email:
-            emails = resp.get("emails") or []
-            if emails and isinstance(emails[0], dict):
-                email = emails[0].get("email", "")
-            elif emails:
-                email = emails[0]
-        if email:
-            return email
-    return ""
-
-
-def prospeo_domain_search(domain: str) -> dict:
-    """
-    NEW Prospeo API flow (old /domain-search was removed March 2026):
-      1. /search-person  -> people at this domain filtered by target titles
-      2. /search-company -> verified company name (with person fallback)
-      3. /enrich-person  -> verified email for each matched person
-    """
-    if not domain:
-        return {}
-
-    titles_proper = [
-        "Founder", "Owner", "Co-Founder", "President",
-        "Co-Owner", "VP of Marketing", "Marketing Director",
-    ]
-
-    # Step 1: find people at this company with the target job titles.
-    person_variants = [
-        {"page": 1, "filters": {
-            "company": {"domains": {"include": [domain]}},
-            "person_job_title": {"include": titles_proper},
-        }},
-        {"page": 1, "filters": {
-            "company": {"domains": {"include": [domain]}},
-        }},
-    ]
-    people = []
-    for body in person_variants:
-        data = _prospeo_post("/search-person", body)
-        if data is not None:
-            people = data.get("results") or []
-            if people:
-                break
-
-    # Step 2: verified company name.
-    company_name = prospeo_find_company_name(domain, people)
-
-    # Step 3: filter by target title + enrich for email.
-    matched_contacts = []
-    for person in people:
-        p = person.get("person", person)
-        title = p.get("current_job_title") or p.get("headline") or ""
-        if not (title and is_target_title(title)):
-            continue
-        full_name = p.get("full_name") or (
-            f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
-        )
-        linkedin = p.get("linkedin_url") or ""
-        email = prospeo_enrich_email(person)
-        matched_contacts.append(Contact(
-            name=full_name,
-            title=title,
-            email=email,
-            linkedin=linkedin,
-        ))
-
-    return {
-        "company_name": company_name,
-        "matched_contacts": matched_contacts,
-        "total": len(people),
+    # Search for the person by name (+ company hint if available)
+    search_body: dict = {
+        "page": 1,
+        "filters": {"person_name": {"include": [full_name]}},
     }
+    if company and company != NO_INFO:
+        search_body["filters"]["company"] = {"names": {"include": [company]}}
+
+    data = _prospeo_post("/search-person", search_body)
+    if not data:
+        # Retry without company filter
+        data = _prospeo_post("/search-person", {
+            "page": 1,
+            "filters": {"person_name": {"include": [full_name]}},
+        })
+
+    people = (data or {}).get("results") or []
+    if not people:
+        print(f"    [prospeo] No person found for {full_name}")
+        return out
+
+    person = people[0].get("person", people[0])
+    linkedin = person.get("linkedin_url") or ""
+    person_id = person.get("person_id") or ""
+
+    if linkedin:
+        out["owner_linkedin_url"] = linkedin.split("?")[0]
+        print(f"    [prospeo] LinkedIn: {out['owner_linkedin_url']}")
+
+    # Enrich for email
+    enrich_body = {}
+    if linkedin:
+        enrich_body = {"linkedin_url": linkedin}
+    elif person_id:
+        enrich_body = {"person_id": person_id}
+
+    if enrich_body:
+        delay(1, 2)
+        edata = _prospeo_post("/enrich-person", enrich_body)
+        if edata:
+            resp_obj = edata.get("response", edata)
+            email_f = resp_obj.get("email")
+            if isinstance(email_f, dict):
+                email = email_f.get("email") or email_f.get("value") or ""
+            else:
+                email = email_f or ""
+            if not email:
+                emails = resp_obj.get("emails") or []
+                email = (emails[0].get("email") if isinstance(emails[0], dict) else emails[0]) if emails else ""
+            if email:
+                out["owner_email_prospeo"] = email
+                print(f"    [prospeo] Email: {email}")
+
+    return out
 
 
-def validate_with_claude(brand_name: str, website_candidate: str) -> dict:
-    if not HAS_CLAUDE:
-        return {}
-    client = anthropic.Anthropic()
-    prompt = f"""A scraper found this website candidate for the brand "{brand_name}":
-Website: {website_candidate}
-
-Is this the correct official website for the brand?
-Reply with JSON only:
-{{"is_correct": true, "official_website": "correct URL or empty string", "confidence": "high|medium|low", "notes": "brief note"}}"""
-    try:
-        resp = client.messages.create(
-            model="claude-opus-4-8",
-            max_tokens=256,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        text = resp.content[0].text.strip()
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            return json.loads(match.group())
-    except Exception as e:
-        print(f"  [claude] {e}")
-    return {}
+# ── Save ──────────────────────────────────────────────────────────────────────
+CSV_FIELDS = [
+    "input_brand",
+    "amazon_search_url", "amazon_product_url",
+    "amazon_seller_name", "amazon_seller_address",
+    "official_website",
+    "contact_email", "contact_form_url",
+    "trademark_owner_first_name", "trademark_owner_last_name", "trademark_owner_email",
+    "owner_linkedin_url", "owner_email_prospeo",
+    "notes",
+]
 
 
 def save_results(results: list, output_file: str):
     with open(output_file, "w") as f:
         json.dump([asdict(r) for r in results], f, indent=2)
-
     csv_file = output_file.replace(".json", ".csv")
-    fieldnames = [
-        "input_brand",
-        "amazon_search_url",
-        "official_website",
-        "verified_company_name",
-        "contact_1_name", "contact_1_title", "contact_1_email", "contact_1_linkedin",
-        "contact_2_name", "contact_2_title", "contact_2_email", "contact_2_linkedin",
-        "contact_3_name", "contact_3_title", "contact_3_email", "contact_3_linkedin",
-        "all_matched_contacts",
-        "confidence",
-        "notes",
-    ]
     with open(csv_file, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows([asdict(r) for r in results])
 
 
-def process_brands(brands: list, use_claude: bool = True,
-                   use_prospeo: bool = True, output_file: str = "results.json") -> list:
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+def process_brands(brands: list, output_file: str = "results.json") -> list:
     results = []
 
     for i, brand in enumerate(brands, 1):
@@ -349,133 +558,99 @@ def process_brands(brands: list, use_claude: bool = True,
         if not brand:
             continue
 
-        print(f"\n[{i}/{len(brands)}] {brand}")
-        result = BrandResult(input_brand=brand)
+        print(f"\n{'='*60}")
+        print(f"[{i}/{len(brands)}] {brand}")
+        print(f"{'='*60}")
+        r = BrandResult(input_brand=brand)
 
-        # Step 1: Amazon URL
-        result.amazon_search_url = make_amazon_url(brand)
-        print(f"  Amazon search : {result.amazon_search_url}")
+        # ── 1. Amazon ──────────────────────────────────────────────
+        print(f"  STEP 1: Amazon seller lookup")
+        seller = amazon_get_seller_info(brand)
+        r.amazon_search_url   = seller["amazon_search_url"]
+        r.amazon_product_url  = seller["amazon_product_url"]
+        r.amazon_seller_name  = seller["amazon_seller_name"]
+        r.amazon_seller_address = seller["amazon_seller_address"]
 
-        # Step 2: Find official website
-        print(f"  Finding official website...")
-        website = find_official_website(brand)
-        result.official_website = website
+        # ── 2. Official website ────────────────────────────────────
+        print(f"  STEP 2: Official website")
+        biz = r.amazon_seller_name if r.amazon_seller_name != NO_INFO else ""
+        website = find_official_website(brand, biz)
+        r.official_website = website
+        print(f"    → {website}")
 
-        if website:
-            print(f"  Website found : {website}")
-            result.confidence = "medium"
+        # ── 3. Contact info ────────────────────────────────────────
+        if website != NO_INFO:
+            print(f"  STEP 3: Contact info")
+            delay(1, 2)
+            r.contact_email, r.contact_form_url = find_contact_info(website)
+
+        # ── 4. USPTO ───────────────────────────────────────────────
+        print(f"  STEP 4: USPTO trademark owner")
+        delay(1, 2)
+        tm = uspto_find_owner(brand, biz)
+        r.trademark_owner_first_name = tm["trademark_owner_first_name"]
+        r.trademark_owner_last_name  = tm["trademark_owner_last_name"]
+        r.trademark_owner_email      = tm["trademark_owner_email"]
+
+        # ── 5. Prospeo (only if we have a real owner name) ─────────
+        if r.trademark_owner_first_name != NO_INFO:
+            print(f"  STEP 5: Prospeo enrichment")
+            delay(1, 2)
+            pe = prospeo_enrich_owner(
+                r.trademark_owner_first_name,
+                r.trademark_owner_last_name,
+                biz,
+            )
+            r.owner_linkedin_url   = pe["owner_linkedin_url"]
+            r.owner_email_prospeo  = pe["owner_email_prospeo"]
         else:
-            print(f"  Website       : not found")
+            print(f"  STEP 5: Skipping Prospeo (no owner name found — saving credits)")
 
-        # Step 3: Claude validation
-        if use_claude and HAS_CLAUDE and website:
-            print(f"  Validating with Claude...")
-            validation = validate_with_claude(brand, website)
-            if validation:
-                if not validation.get("is_correct", True):
-                    result.official_website = validation.get("official_website", website)
-                    website = result.official_website
-                result.confidence = validation.get("confidence", result.confidence)
-                result.notes = validation.get("notes", "")
-                print(f"  Confidence    : {result.confidence}")
-
-        # Step 4: Prospeo — verify company name + find key contacts
-        if use_prospeo and website:
-            domain = extract_domain(website)
-            print(f"  Prospeo lookup: {domain}")
-            prospeo = prospeo_domain_search(domain)
-
-            if prospeo:
-                result.verified_company_name = prospeo.get("company_name", "")
-                if result.verified_company_name:
-                    print(f"  Company name  : {result.verified_company_name}")
-
-                contacts = prospeo.get("matched_contacts", [])
-                if contacts:
-                    print(f"  Key contacts  : {len(contacts)} found")
-                    for c in contacts:
-                        print(f"    - {c.name} | {c.title} | {c.email}")
-
-                    # Fill up to 3 contact slots
-                    for idx, slot in enumerate(["contact_1", "contact_2", "contact_3"]):
-                        if idx < len(contacts):
-                            c = contacts[idx]
-                            setattr(result, f"{slot}_name", c.name)
-                            setattr(result, f"{slot}_title", c.title)
-                            setattr(result, f"{slot}_email", c.email)
-                            setattr(result, f"{slot}_linkedin", c.linkedin)
-
-                    # Summarise any extras beyond 3
-                    if len(contacts) > 3:
-                        extras = [f"{c.name} ({c.title})" for c in contacts[3:]]
-                        result.all_matched_contacts = "; ".join(extras)
-                else:
-                    print(f"  Key contacts  : none with target titles")
-            else:
-                print(f"  Prospeo       : no data returned")
-
-        results.append(result)
+        results.append(r)
         save_results(results, output_file)
+        print(f"\n  ✓ Saved after brand {i}")
 
         if i < len(brands):
-            random_delay(3, 6)
+            delay(3, 6)
 
     return results
 
 
 def print_summary(results: list):
-    print("\n" + "=" * 70)
-    print("RESULTS SUMMARY")
-    print("=" * 70)
+    print(f"\n{'='*70}\nRESULTS SUMMARY\n{'='*70}")
     for r in results:
-        print(f"\nBrand            : {r.input_brand}")
-        print(f"  Amazon search  : {r.amazon_search_url}")
-        print(f"  Official site  : {r.official_website or 'not found'}")
-        print(f"  Company name   : {r.verified_company_name or 'not verified'}")
-        for slot in ["contact_1", "contact_2", "contact_3"]:
-            name = getattr(r, f"{slot}_name")
-            if name:
-                title = getattr(r, f"{slot}_title")
-                email = getattr(r, f"{slot}_email")
-                print(f"  Contact        : {name} | {title} | {email}")
-        print(f"  Confidence     : {r.confidence}")
-        if r.notes:
-            print(f"  Notes          : {r.notes}")
+        print(f"\n  Brand           : {r.input_brand}")
+        print(f"  Seller name     : {r.amazon_seller_name}")
+        print(f"  Seller address  : {r.amazon_seller_address}")
+        print(f"  Official website: {r.official_website}")
+        print(f"  Contact email   : {r.contact_email}")
+        print(f"  Contact form    : {r.contact_form_url}")
+        print(f"  Owner           : {r.trademark_owner_first_name} {r.trademark_owner_last_name}")
+        print(f"  Owner LinkedIn  : {r.owner_linkedin_url}")
+        print(f"  Owner email     : {r.owner_email_prospeo}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Find brands on Amazon, verify company via Prospeo, extract key contacts."
-    )
-    parser.add_argument("brands", nargs="*", help="Brand names to look up.")
-    parser.add_argument("--file", "-f", help="Text file with one brand per line.")
-    parser.add_argument("--output", "-o", default="results.json", help="Output JSON file.")
-    parser.add_argument("--no-claude", action="store_true", help="Disable Claude AI validation.")
-    parser.add_argument("--no-prospeo", action="store_true", help="Disable Prospeo lookup.")
+    parser = argparse.ArgumentParser(description="Brand enrichment pipeline")
+    parser.add_argument("brands", nargs="*")
+    parser.add_argument("--file", "-f")
+    parser.add_argument("--output", "-o", default="results.json")
     args = parser.parse_args()
 
     brands = list(args.brands)
     if args.file:
         with open(args.file) as f:
-            brands += [line.strip() for line in f if line.strip()]
-
+            brands += [l.strip() for l in f if l.strip()]
     if not brands:
-        print("No brands provided. Examples:")
-        print("  python3 brand_finder.py 'Nike' 'Sony'")
-        print("  python3 brand_finder.py --file brands.txt")
+        print("No brands. Example: python3 brand_finder.py 'Americanflat'")
         sys.exit(1)
 
     print(f"Processing {len(brands)} brand(s)...")
-    results = process_brands(
-        brands,
-        use_claude=not args.no_claude,
-        use_prospeo=not args.no_prospeo,
-        output_file=args.output
-    )
+    results = process_brands(brands, output_file=args.output)
     print_summary(results)
     csv_file = args.output.replace(".json", ".csv")
-    print(f"\nSaved to     : {args.output}")
-    print(f"Spreadsheet  : {csv_file}  ← open in Excel or Numbers")
+    print(f"\nSaved to    : {args.output}")
+    print(f"Spreadsheet : {csv_file}  ← open in Excel or Numbers")
 
 
 if __name__ == "__main__":
