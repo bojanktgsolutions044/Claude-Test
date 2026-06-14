@@ -384,14 +384,43 @@ def _page_mentions(url: str, terms: list) -> Optional[bool]:
     return False
 
 
+def _candidate_domains(name: str) -> list:
+    """Build likely homepage URLs from a brand/business name."""
+    s = _slug(name)
+    if not s or len(s) > 30:
+        return []
+    return [
+        f"https://www.{s}.com", f"https://{s}.com",
+        f"https://www.{s}s.com", f"https://{s}s.com",
+        f"https://{s}.co", f"https://www.{s}.co",
+    ]
+
+
 def find_official_website(brand: str, business_name: str) -> str:
     """
     Find the brand's OWN homepage. A candidate is only accepted if its homepage
     actually mentions the brand or business name — this prevents picking
     look-alike domains (e.g. skysports.com for 'Amy Sport').
+    Strategy A: guess the domain directly (amysport.com) and verify content.
+    Strategy B: DuckDuckGo search + content verification.
     """
-    candidates = []
     search_names = list(dict.fromkeys(x for x in [brand, business_name] if x and x != NO_INFO))
+
+    # ── Strategy A: direct domain guesses (no search engine needed) ──────────
+    print(f"    [website] Trying direct domain guesses...")
+    tried = set()
+    for name in search_names:
+        for guess in _candidate_domains(name):
+            if guess in tried:
+                continue
+            tried.add(guess)
+            if _page_mentions(guess, search_names) is True:
+                print(f"    [website] Verified direct domain: {guess}")
+                return homepage(guess)
+            delay(0.5, 1.2)
+
+    # ── Strategy B: DuckDuckGo search ────────────────────────────────────────
+    candidates = []
 
     for name in search_names:
         for q in [f'{name} official website', f'"{name}" homepage', name]:
@@ -479,6 +508,51 @@ def find_contact_info(website_url: str) -> tuple:
         delay(1, 2)
 
     return found_email, found_form
+
+
+# ── STEP 3b: Founder name from the brand's own website ───────────────────────
+FOUNDER_PATTERNS = [
+    r'founded\s+(?:in\s+\d{4}\s+)?by\s+([A-Z][a-zA-Z\'\-]+\s+[A-Z][a-zA-Z\'\-]+)',
+    r'launched\s+(?:in\s+\d{4}\s+)?by\s+([A-Z][a-zA-Z\'\-]+\s+[A-Z][a-zA-Z\'\-]+)',
+    r'started\s+(?:in\s+\d{4}\s+)?by\s+([A-Z][a-zA-Z\'\-]+\s+[A-Z][a-zA-Z\'\-]+)',
+    r'created\s+by\s+([A-Z][a-zA-Z\'\-]+\s+[A-Z][a-zA-Z\'\-]+)',
+    r'([A-Z][a-zA-Z\'\-]+\s+[A-Z][a-zA-Z\'\-]+),?\s+(?:the\s+)?(?:founder|co-founder|owner|ceo)\b',
+]
+
+
+def website_find_founder(website: str) -> tuple:
+    """
+    Scrape the brand's homepage + About pages for a founder statement like
+    'launched in 2017 by Amy Lipton'. Returns (first, last) or (NO_INFO, NO_INFO).
+    This is the most trustworthy owner source — the brand's own words.
+    """
+    if website == NO_INFO:
+        return NO_INFO, NO_INFO
+
+    base = website.rstrip("/")
+    paths = ["", "/about", "/about-us", "/pages/about", "/pages/about-us",
+             "/our-story", "/pages/our-story", "/pages/about-amy", "/story"]
+
+    for path in paths:
+        resp = safe_get(base + path)
+        if not resp:
+            continue
+        text = BeautifulSoup(resp.text, "lxml").get_text(" ")
+        text = re.sub(r'\s+', ' ', text)
+        for pat in FOUNDER_PATTERNS:
+            m = re.search(pat, text)
+            if m:
+                name = m.group(1).strip()
+                # Avoid false hits like "Privacy Policy"
+                if name.lower() in ("privacy policy", "terms service", "all rights"):
+                    continue
+                parts = name.split()
+                if len(parts) >= 2:
+                    print(f"    [website] Founder on site: {name} (from {path or '/'})")
+                    return parts[0], " ".join(parts[1:])
+        delay(1, 2)
+
+    return NO_INFO, NO_INFO
 
 
 # ── STEP 4: USPTO ─────────────────────────────────────────────────────────────
@@ -821,15 +895,25 @@ def process_brands(brands: list, output_file: str = "results.json") -> list:
         r.official_website = find_official_website(brand, biz)
         print(f"    → {r.official_website}")
 
-        # 3. Contact info
+        # 3. Contact info + founder from the brand's own website
         if r.official_website != NO_INFO:
             print(f"  STEP 3: Contact info")
             delay(1, 2)
             r.contact_email, r.contact_form_url = find_contact_info(r.official_website)
 
-        # 4. USPTO — only for US-based businesses
+            print(f"  STEP 3b: Founder from website")
+            delay(1, 2)
+            wf, wl = website_find_founder(r.official_website)
+            if wf != NO_INFO:
+                r.trademark_owner_first_name = wf
+                r.trademark_owner_last_name  = wl
+                r.notes = (r.notes + "; owner via website").lstrip("; ")
+
+        # 4. USPTO — only for US-based businesses, and only if owner still unknown
         print(f"  STEP 4: USPTO trademark owner")
-        if not is_us_address(r.amazon_seller_address):
+        if r.trademark_owner_first_name != NO_INFO:
+            print(f"    [uspto] Skipped — owner already found")
+        elif not is_us_address(r.amazon_seller_address):
             print(f"    [uspto] Skipped — business address is outside the US")
             r.notes = (r.notes + "; non-US seller, USPTO skipped").lstrip("; ")
         else:
