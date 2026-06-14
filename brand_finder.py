@@ -453,10 +453,9 @@ def _name_from_linkedin_title(title: str) -> tuple:
 
 def find_linkedin_urls(brand: str, business_name: str) -> dict:
     """
-    A. Company page: search '{brand} site:linkedin.com/company' on DDG.
-    B. Owner page: search '{brand} {Title} linkedin' for each title in priority
-       order; take the first linkedin.com/in/ URL whose snippet mentions the title.
-       Also extract the owner's real name from the result title.
+    A. Company page: search DDG, then validate the URL slug contains the brand.
+    B. Owner page: search by each title in priority order; parse owner name from
+       the result title. Owner name is ONLY taken from LinkedIn — never from Prospeo.
     """
     out = {
         "company_linkedin_url": NO_INFO,
@@ -466,16 +465,26 @@ def find_linkedin_urls(brand: str, business_name: str) -> dict:
         "owner_last": NO_INFO,
     }
     search_name = business_name if (business_name and business_name != NO_INFO) else brand
+    brand_slug = _slug(brand)
 
-    # A) Company LinkedIn page
+    # A) Company LinkedIn — must validate slug matches brand name
     print(f"    [linkedin] Searching company page...")
-    for q in [
+    queries = [
         f'"{search_name}" site:linkedin.com/company',
-        f'{search_name} linkedin company profile',
-    ]:
-        for h in ddg(q, n=6):
+        f'"{brand}" site:linkedin.com/company',
+        f'{brand} linkedin company profile',
+    ]
+    for q in queries:
+        for h in ddg(q, n=8):
             url = h.get("href", "")
-            if "linkedin.com/company/" in url:
+            if "linkedin.com/company/" not in url:
+                continue
+            # Extract the slug from the URL and check it matches the brand
+            slug_match = re.search(r'linkedin\.com/company/([^/?]+)', url)
+            if not slug_match:
+                continue
+            url_slug = _slug(slug_match.group(1))
+            if brand_slug in url_slug or url_slug in brand_slug:
                 out["company_linkedin_url"] = url.split("?")[0]
                 print(f"    [linkedin] Company: {out['company_linkedin_url']}")
                 break
@@ -483,7 +492,7 @@ def find_linkedin_urls(brand: str, business_name: str) -> dict:
             break
     delay(1, 2)
 
-    # B) Owner / Founder LinkedIn profile — searched by title priority
+    # B) Owner LinkedIn — title-priority search, parse name from result title
     print(f"    [linkedin] Searching owner profile by title...")
     for title in OWNER_TITLE_SEARCHES:
         q = f'"{brand}" {title} linkedin'
@@ -491,14 +500,18 @@ def find_linkedin_urls(brand: str, business_name: str) -> dict:
             url = h.get("href", "")
             result_title = h.get("title", "")
             snippet = (h.get("body", "") + result_title).lower()
-            if "linkedin.com/in/" in url and title.lower() in snippet:
-                out["owner_linkedin_url"] = url.split("?")[0]
-                out["owner_linkedin_title"] = title
-                first, last = _name_from_linkedin_title(result_title)
-                out["owner_first"], out["owner_last"] = first, last
-                name_str = f"{first} {last}" if first != NO_INFO else "(name not parsed)"
-                print(f"    [linkedin] Owner ({title}): {name_str} — {out['owner_linkedin_url']}")
-                break
+            if "linkedin.com/in/" not in url:
+                continue
+            if title.lower() not in snippet:
+                continue
+            out["owner_linkedin_url"] = url.split("?")[0]
+            out["owner_linkedin_title"] = title
+            first, last = _name_from_linkedin_title(result_title)
+            out["owner_first"], out["owner_last"] = first, last
+            name_str = f"{first} {last}" if first != NO_INFO else "(name not parsed)"
+            print(f"    [linkedin] Owner ({title}): {name_str}")
+            print(f"    [linkedin] Profile: {out['owner_linkedin_url']}")
+            break
         if out["owner_linkedin_url"] != NO_INFO:
             break
         delay(1, 2)
@@ -535,28 +548,30 @@ def _pick_best_person(people: list) -> Optional[dict]:
     return people[0].get("person", people[0]) if people else None
 
 
-def prospeo_enrich(
-    website: str, brand: str, business_name: str,
+def prospeo_get_email(
     known_first: str, known_last: str,
     owner_linkedin_url: str,
-) -> dict:
+    brand: str, business_name: str,
+) -> str:
     """
-    Prospeo search order:
-      1. By known owner name (if USPTO gave us one)
-      2. By website domain + owner titles
-      3. By brand/business name + owner titles
-    Then enrich the matched person for email.
-    Backfills owner name + LinkedIn if still unknown.
-    """
-    out = {
-        "owner_email_prospeo": NO_INFO,
-        "found_first": NO_INFO,
-        "found_last": NO_INFO,
-        "found_linkedin": NO_INFO,
-    }
-    person = None
+    Use Prospeo to find the owner's email ONLY.
+    Owner identity is never determined here — only enrichment.
 
-    # Strategy 1: by known owner name
+    Search order:
+      1. Enrich directly via the LinkedIn URL we already found (most precise)
+      2. Search by owner full name + company → enrich matched person
+      3. Search by brand/business name + owner titles → enrich matched person
+         (only accepted if the person's company name matches the brand)
+    """
+    # 1. Direct enrich via LinkedIn URL (fastest, most accurate)
+    if owner_linkedin_url and owner_linkedin_url != NO_INFO:
+        print(f"    [prospeo] Enriching via LinkedIn URL...")
+        edata = _prospeo_post("/enrich-person", {"linkedin_url": owner_linkedin_url})
+        email = _extract_email_from_enrich(edata)
+        if email:
+            return email
+
+    # 2. Search by owner name
     if known_first != NO_INFO and known_last != NO_INFO:
         full_name = f"{known_first} {known_last}"
         body: dict = {"page": 1, "filters": {"person_name": {"include": [full_name]}}}
@@ -566,77 +581,80 @@ def prospeo_enrich(
         person = _pick_best_person((data or {}).get("results") or [])
         if person:
             print(f"    [prospeo] Matched by name: {full_name}")
+            email = _enrich_person_for_email(person)
+            if email:
+                return email
 
-    # Strategy 2: by website domain
-    if not person and website and website != NO_INFO:
-        domain = _domain_from_url(website)
-        print(f"    [prospeo] Searching by domain: {domain}")
+    # 3. Search by brand/company — only accept if company name matches
+    brand_slug = _slug(brand)
+    for search_name in list(dict.fromkeys(
+        x for x in [business_name, brand] if x and x != NO_INFO
+    )):
+        print(f"    [prospeo] Searching by company: {search_name}")
         data = _prospeo_post("/search-person", {
             "page": 1,
             "filters": {
-                "company": {"domains": {"include": [domain]}},
+                "company": {"names": {"include": [search_name]}},
                 "person_job_title": {"include": OWNER_TITLE_SEARCHES},
             },
         })
-        person = _pick_best_person((data or {}).get("results") or [])
-
-    # Strategy 3: by brand / business name
-    if not person:
-        for search_name in list(dict.fromkeys(
-            x for x in [business_name, brand] if x and x != NO_INFO
-        )):
-            print(f"    [prospeo] Searching by company name: {search_name}")
-            data = _prospeo_post("/search-person", {
-                "page": 1,
-                "filters": {
-                    "company": {"names": {"include": [search_name]}},
-                    "person_job_title": {"include": OWNER_TITLE_SEARCHES},
-                },
-            })
-            person = _pick_best_person((data or {}).get("results") or [])
-            if person:
-                break
-
-    if not person:
-        print(f"    [prospeo] No person found")
-        return out
-
-    out["found_first"] = person.get("first_name") or NO_INFO
-    out["found_last"]  = person.get("last_name")  or NO_INFO
-    full = person.get("full_name") or f"{out['found_first']} {out['found_last']}"
-    print(f"    [prospeo] Person: {full} | {person.get('current_job_title', '')}")
-
-    p_linkedin = person.get("linkedin_url") or ""
-    if p_linkedin:
-        out["found_linkedin"] = p_linkedin.split("?")[0]
-
-    # Enrich for email
-    enrich_body = {}
-    if p_linkedin:
-        enrich_body = {"linkedin_url": p_linkedin}
-    elif person.get("person_id"):
-        enrich_body = {"person_id": person["person_id"]}
-    elif owner_linkedin_url and owner_linkedin_url != NO_INFO:
-        enrich_body = {"linkedin_url": owner_linkedin_url}
-
-    if enrich_body:
-        delay(1, 2)
-        edata = _prospeo_post("/enrich-person", enrich_body)
-        if edata:
-            ro = edata.get("response", edata)
-            ef = ro.get("email")
-            if isinstance(ef, dict):
-                email = ef.get("email") or ef.get("value") or ""
-            else:
-                email = ef or ""
-            if not email:
-                emails = ro.get("emails") or []
-                email = (emails[0].get("email") if isinstance(emails[0], dict) else emails[0]) if emails else ""
+        people = (data or {}).get("results") or []
+        for candidate in people:
+            p = candidate.get("person", candidate)
+            # Verify the person's current company actually matches our brand
+            current_company = ""
+            for job in p.get("job_history", []):
+                if job.get("current"):
+                    current_company = job.get("company_name", "")
+                    break
+            if not current_company:
+                current_company = p.get("headline", "")
+            if brand_slug not in _slug(current_company):
+                print(f"    [prospeo] Skipping {p.get('full_name')} — company mismatch ({current_company})")
+                continue
+            print(f"    [prospeo] Matched: {p.get('full_name')} at {current_company}")
+            email = _enrich_person_for_email(p)
             if email:
-                out["owner_email_prospeo"] = email
-                print(f"    [prospeo] Email: {email}")
+                return email
+            break
 
-    return out
+    print(f"    [prospeo] No email found")
+    return NO_INFO
+
+
+def _extract_email_from_enrich(edata: Optional[dict]) -> str:
+    """Pull email string out of a /enrich-person response."""
+    if not edata:
+        return ""
+    ro = edata.get("response", edata)
+    ef = ro.get("email")
+    if isinstance(ef, dict):
+        email = ef.get("email") or ef.get("value") or ""
+    else:
+        email = ef or ""
+    if not email:
+        emails = ro.get("emails") or []
+        if emails:
+            email = emails[0].get("email", "") if isinstance(emails[0], dict) else emails[0]
+    if email:
+        print(f"    [prospeo] Email: {email}")
+    return email
+
+
+def _enrich_person_for_email(person: dict) -> str:
+    """Given a person dict from search-person, enrich for email."""
+    linkedin = person.get("linkedin_url") or ""
+    person_id = person.get("person_id") or ""
+    enrich_body = {}
+    if linkedin:
+        enrich_body = {"linkedin_url": linkedin}
+    elif person_id:
+        enrich_body = {"person_id": person_id}
+    if not enrich_body:
+        return ""
+    delay(1, 2)
+    edata = _prospeo_post("/enrich-person", enrich_body)
+    return _extract_email_from_enrich(edata)
 
 
 # ── Save ──────────────────────────────────────────────────────────────────────
@@ -705,7 +723,7 @@ def process_brands(brands: list, output_file: str = "results.json") -> list:
         r.trademark_owner_first_name = tm["trademark_owner_first_name"]
         r.trademark_owner_last_name  = tm["trademark_owner_last_name"]
 
-        # 5. LinkedIn (company page + owner profile via DDG title searches)
+        # 5. LinkedIn — company page + owner profile via DDG title searches
         print(f"  STEP 5: LinkedIn search")
         delay(1, 2)
         li = find_linkedin_urls(brand, biz)
@@ -713,32 +731,22 @@ def process_brands(brands: list, output_file: str = "results.json") -> list:
         r.owner_linkedin_url   = li["owner_linkedin_url"]
         r.owner_linkedin_title = li["owner_linkedin_title"]
 
-        # Owner name priority: USPTO person → LinkedIn profile name.
-        # The LinkedIn name is trusted over a domain/company guess from Prospeo.
+        # Owner name: LinkedIn is the primary trusted source, USPTO is secondary.
+        # Prospeo is NEVER used to determine who the owner is.
         if r.trademark_owner_first_name == NO_INFO and li["owner_first"] != NO_INFO:
             r.trademark_owner_first_name = li["owner_first"]
             r.trademark_owner_last_name  = li["owner_last"]
             r.notes = (r.notes + "; owner name via LinkedIn").lstrip("; ")
 
-        # 6. Prospeo — verify owner + get email (use the name we trust)
-        print(f"  STEP 6: Prospeo enrichment")
+        # 6. Prospeo — email only, for the owner we already identified
+        print(f"  STEP 6: Prospeo — email lookup")
         delay(1, 2)
-        pe = prospeo_enrich(
-            r.official_website, brand, biz,
+        r.owner_email_prospeo = prospeo_get_email(
             r.trademark_owner_first_name,
             r.trademark_owner_last_name,
             r.owner_linkedin_url,
+            brand, biz,
         )
-        r.owner_email_prospeo = pe["owner_email_prospeo"]
-        # Backfill owner name from Prospeo ONLY if still unknown
-        if r.trademark_owner_first_name == NO_INFO and pe["found_first"] != NO_INFO:
-            r.trademark_owner_first_name = pe["found_first"]
-            r.trademark_owner_last_name  = pe["found_last"]
-            r.notes = (r.notes + "; owner name via Prospeo").lstrip("; ")
-        # Backfill owner LinkedIn from Prospeo if DDG found none
-        if r.owner_linkedin_url == NO_INFO and pe["found_linkedin"] != NO_INFO:
-            r.owner_linkedin_url = pe["found_linkedin"]
-            r.notes = (r.notes + "; owner LinkedIn via Prospeo").lstrip("; ")
 
         results.append(r)
         save_results(results, output_file)
