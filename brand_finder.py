@@ -81,10 +81,8 @@ class BrandResult:
     owner_email_prospeo: str = NO_INFO
     # ── Stage D — no-website fallback (Amazon-only brands) ──────────────────
     amazon_seller_contact: str = NO_INFO    # phone/email shown on seller page
-    customs_importer_name: str = NO_INFO    # US importer of record (customs)
-    contact_source: str = NO_INFO           # amazon_seller | customs | registry | tsdr
+    contact_source: str = NO_INFO           # amazon_seller | registry | tsdr
     manual_amazon_url: str = NO_INFO        # human: check INFORM Act seller info
-    manual_importyeti_url: str = NO_INFO    # human: free import-records lookup
     manual_registry_url: str = NO_INFO      # human: company registry search
     manual_tsdr_url: str = NO_INFO          # human: USPTO TSDR (correspondent email)
     status: str = NO_INFO                   # resolved|manual_lookup_needed|offshore_no_contact|not_found
@@ -186,10 +184,13 @@ def _domain_from_url(url: str) -> str:
 def _amazon_product_urls(brand: str) -> list:
     """Find up to 10 Amazon /dp/ product URLs via DDG (avoids bot detection)."""
     urls = []
+    bslug = brand.replace(" ", "+")
     queries = [
         f'site:amazon.com/dp "{brand}"',
         f'site:amazon.com "{brand}" buy',
         f'amazon.com "{brand}" product',
+        f'"{brand}" amazon.com sold by',
+        f'{brand} site:amazon.com',
     ]
     seen = set()
     for q in queries:
@@ -200,6 +201,20 @@ def _amazon_product_urls(brand: str) -> list:
                 urls.append(u)
         if len(urls) >= 10:
             break
+
+    # Last resort: fetch the Amazon search page directly for /dp/ links in the HTML
+    if not urls:
+        print(f"    [amazon] DDG found nothing — trying Amazon search page directly...")
+        resp = safe_get(f"https://www.amazon.com/s?k={bslug}", timeout=15)
+        if resp:
+            for m in re.finditer(r'href="(/[^"]+/dp/[A-Z0-9]{10}[^"]*)"', resp.text):
+                u = "https://www.amazon.com" + m.group(1).split("?")[0]
+                if u not in seen:
+                    seen.add(u)
+                    urls.append(u)
+                if len(urls) >= 10:
+                    break
+
     return urls[:10]
 
 
@@ -495,7 +510,10 @@ def find_contact_info(website_url: str) -> tuple:
         "/contact", "/contact-us", "/pages/contact", "/pages/contact-us",
         "/support", "/help", "/about/contact", "/about-us",
     ]
-    email_re = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
+    email_re = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,6}')
+    # TLDs that are actually file extensions, not email domains
+    skip_tlds = {"png", "jpg", "jpeg", "gif", "svg", "webp", "pdf", "zip",
+                 "js", "css", "xml", "json", "woff", "ttf", "mp4", "mp3"}
     skip_domains = {"example.com", "sentry.io", "schema.org", "w3.org", "wixpress.com"}
 
     found_email = NO_INFO
@@ -506,10 +524,13 @@ def find_contact_info(website_url: str) -> tuple:
         if not resp:
             continue
         for em in email_re.findall(resp.text):
-            if em.split("@")[-1].lower() not in skip_domains and not em.endswith(".png"):
-                found_email = em
-                print(f"    [contact] Email: {em}")
-                break
+            tld = em.rsplit(".", 1)[-1].lower()
+            domain = em.split("@")[-1].lower()
+            if tld in skip_tlds or domain in skip_domains:
+                continue
+            found_email = em
+            print(f"    [contact] Email: {em}")
+            break
         if found_email == NO_INFO and BeautifulSoup(resp.text, "lxml").find("form"):
             found_form = base + path
             print(f"    [contact] Form: {found_form}")
@@ -856,8 +877,8 @@ def _enrich_person_for_email(person: dict) -> str:
 # Runs only for brands the earlier stages could not resolve (no website AND/OR
 # no owner name). It collects BUSINESS contact info via compliant channels and,
 # for anything it can't auto-resolve, leaves a human a ready-made set of lookup
-# URLs in manual_worklist.csv. It NEVER scrapes amazon.com / importyeti.com /
-# tsdr directly, and NEVER guesses or pattern-generates an email address.
+# URLs in manual_worklist.csv. It NEVER scrapes amazon.com / tsdr directly,
+# and NEVER guesses or pattern-generates an email address.
 
 # Countries with no usable public owner registry → tag and stop (don't chase a
 # person or an email for these).
@@ -965,52 +986,6 @@ def stage_d1_amazon_seller(brand: str) -> dict:
     return out
 
 
-# ── D2: Customs / import records ──────────────────────────────────────────────
-def stage_d2_customs(brand: str, entity_name: str) -> dict:
-    """
-    Query ImportGenius / Panjiva by brand and entity IF an API key is present in
-    the environment. Never scrapes importyeti.com — always returns a free manual
-    ImportYeti search URL for a human.
-    """
-    out = {"importer_name": NO_INFO, "importer_address": NO_INFO,
-           "manual_importyeti_url": f"https://www.importyeti.com/search?q={quote_plus(brand)}"}
-    ig_key = os.environ.get("IMPORTGENIUS_API_KEY")
-    pj_key = os.environ.get("PANJIVA_API_KEY")
-    if not (ig_key or pj_key):
-        print(f"    [D2] No customs API key set — manual_importyeti_url stored")
-        return out
-
-    terms = list(dict.fromkeys(x for x in [brand, entity_name] if x and x != NO_INFO))
-    for term in terms:
-        try:
-            if ig_key:
-                resp = requests.get(
-                    "https://api.importgenius.com/v1/shipments",
-                    params={"q": term, "limit": 5},
-                    headers={"Authorization": f"Bearer {ig_key}"}, timeout=20,
-                )
-            else:
-                resp = requests.get(
-                    "https://api.panjiva.com/v1/shipments",
-                    params={"q": term}, headers={"Authorization": f"Bearer {pj_key}"},
-                    timeout=20,
-                )
-            if resp.status_code != 200:
-                continue
-            rows = (resp.json().get("data") or resp.json().get("shipments") or [])
-            if rows:
-                row = rows[0]
-                out["importer_name"] = (row.get("consignee_name")
-                                        or row.get("importer") or NO_INFO)
-                out["importer_address"] = (row.get("consignee_address")
-                                           or row.get("importer_address") or NO_INFO)
-                print(f"    [D2] Importer of record: {out['importer_name']}")
-                break
-        except Exception as e:
-            print(f"    [D2] customs API error: {e}")
-        delay(1, 2)
-    return out
-
 
 # ── D3: Registry bridge — business name → owner ──────────────────────────────
 def stage_d3_registry(brand: str, business_name: str, country: str) -> dict:
@@ -1094,18 +1069,8 @@ def stage_d_fallback(r: "BrandResult", brand: str):
 
     entity = r.amazon_seller_name if r.amazon_seller_name != NO_INFO else ""
 
-    # D2 — Customs / import records
-    delay(1, 2)
-    d2 = stage_d2_customs(brand, entity)
-    r.customs_importer_name = d2["importer_name"]
-    r.manual_importyeti_url = d2["manual_importyeti_url"]
-    if d2["importer_name"] != NO_INFO and not entity:
-        entity = d2["importer_name"]
-    if d2["importer_name"] != NO_INFO and r.contact_source == NO_INFO:
-        r.contact_source = "customs"
-
     # Offshore check — tag and stop (no public owner registry to chase)
-    if _is_offshore(r.amazon_seller_address, d2.get("importer_address", "")):
+    if _is_offshore(r.amazon_seller_address):
         r.status = "offshore_no_contact"
         r.notes = (r.notes + "; offshore entity, no owner registry").lstrip("; ")
         print(f"    [D] Offshore entity detected → status=offshore_no_contact")
@@ -1131,11 +1096,10 @@ def stage_d_fallback(r: "BrandResult", brand: str):
 
     # Final status for this fallback brand
     has_owner = r.trademark_owner_first_name != NO_INFO
-    has_contact = (r.contact_email != NO_INFO or r.amazon_seller_name != NO_INFO
-                   or r.customs_importer_name != NO_INFO)
+    has_contact = (r.contact_email != NO_INFO or r.amazon_seller_name != NO_INFO)
     if has_owner and has_contact:
         r.status = "resolved"
-    elif any(u != NO_INFO for u in (r.manual_amazon_url, r.manual_importyeti_url,
+    elif any(u != NO_INFO for u in (r.manual_amazon_url,
                                     r.manual_registry_url, r.manual_tsdr_url)):
         r.status = "manual_lookup_needed"
     else:
@@ -1148,23 +1112,20 @@ CSV_FIELDS = [
     "input_brand",
     "amazon_search_url", "amazon_product_url",
     "amazon_seller_name", "amazon_seller_address", "amazon_seller_contact",
-    "customs_importer_name",
     "official_website",
     "contact_email", "contact_form_url", "contact_source",
     "trademark_owner_first_name", "trademark_owner_last_name",
     "company_linkedin_url",
     "owner_linkedin_url", "owner_linkedin_title",
     "owner_email_prospeo",
-    "manual_amazon_url", "manual_importyeti_url",
-    "manual_registry_url", "manual_tsdr_url",
+    "manual_amazon_url", "manual_registry_url", "manual_tsdr_url",
     "status",
     "notes",
 ]
 
 MANUAL_FIELDS = [
     "input_brand",
-    "manual_amazon_url", "manual_importyeti_url",
-    "manual_registry_url", "manual_tsdr_url",
+    "manual_amazon_url", "manual_registry_url", "manual_tsdr_url",
 ]
 
 
@@ -1300,11 +1261,8 @@ def print_summary(results: list):
         print(f"  Owner LinkedIn     : {r.owner_linkedin_url} ({r.owner_linkedin_title})")
         print(f"  Owner email        : {r.owner_email_prospeo}")
         print(f"  Status             : {r.status}")
-        if r.customs_importer_name != NO_INFO:
-            print(f"  Customs importer   : {r.customs_importer_name}")
         if r.status == "manual_lookup_needed":
             print(f"  Manual Amazon      : {r.manual_amazon_url}")
-            print(f"  Manual ImportYeti  : {r.manual_importyeti_url}")
             print(f"  Manual Registry    : {r.manual_registry_url}")
             print(f"  Manual TSDR        : {r.manual_tsdr_url}")
         if r.notes:
@@ -1318,7 +1276,7 @@ def print_fill_rates(results: list):
     n = len(results)
     print(f"\n{'='*70}\nFILL-RATE PER FIELD  (out of {n} brand(s))\n{'='*70}")
     fields = [
-        "amazon_seller_name", "amazon_seller_address", "customs_importer_name",
+        "amazon_seller_name", "amazon_seller_address",
         "official_website", "contact_email", "contact_source",
         "trademark_owner_first_name", "company_linkedin_url",
         "owner_linkedin_url", "owner_email_prospeo",
