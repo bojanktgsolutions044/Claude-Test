@@ -141,122 +141,155 @@ def is_target_title(title: str) -> bool:
     return any(t in title_lower for t in TARGET_TITLES)
 
 
+def _prospeo_headers() -> dict:
+    return {"Content-Type": "application/json", "X-KEY": PROSPEO_API_KEY}
+
+
+def _prospeo_post(path: str, body: dict) -> Optional[dict]:
+    """POST to a Prospeo endpoint; return parsed JSON or None on failure."""
+    try:
+        resp = requests.post(
+            f"{PROSPEO_API_URL}{path}",
+            headers=_prospeo_headers(),
+            json=body,
+            timeout=20,
+        )
+        data = resp.json()
+        if resp.status_code != 200 or data.get("error"):
+            msg = data.get("error_toast") or data.get("message") or resp.status_code
+            print(f"  [prospeo] {path} -> {msg}")
+            return None
+        return data
+    except Exception as e:
+        print(f"  [prospeo] {path} request failed: {e}")
+        return None
+
+
+def prospeo_find_company_name(domain: str, fallback_results: list) -> str:
+    """
+    Verify the real company name from a website domain via /search-company.
+    Falls back to the company name on a matched person's CURRENT job.
+    """
+    # Try the documented nested filter shapes for search-company.
+    company_filter_variants = [
+        {"page": 1, "filters": {"company": {"domains": {"include": [domain]}}}},
+        {"page": 1, "filters": {"company_domain": {"include": [domain]}}},
+        {"page": 1, "filters": {"company": {"websites": {"include": [domain]}}}},
+    ]
+    for body in company_filter_variants:
+        data = _prospeo_post("/search-company", body)
+        if data:
+            results = data.get("results") or []
+            if results:
+                comp = results[0].get("company", results[0])
+                name = comp.get("name") or comp.get("company_name") or ""
+                if name:
+                    return name
+            break  # endpoint worked but no match; don't retry other shapes
+
+    # Fallback: take the company name from a matched person's current job.
+    for person in fallback_results:
+        p = person.get("person", person)
+        for job in p.get("job_history", []):
+            if job.get("current") and job.get("company_name"):
+                return job["company_name"]
+    return ""
+
+
+def prospeo_enrich_email(person: dict) -> str:
+    """Get a verified email for a person via /enrich-person (uses LinkedIn URL)."""
+    p = person.get("person", person)
+    linkedin = p.get("linkedin_url") or ""
+    person_id = p.get("person_id") or ""
+
+    enrich_bodies = []
+    if linkedin:
+        enrich_bodies.append({"linkedin_url": linkedin})
+    if person_id:
+        enrich_bodies.append({"person_id": person_id})
+
+    for body in enrich_bodies:
+        data = _prospeo_post("/enrich-person", body)
+        if not data:
+            continue
+        resp = data.get("response", data)
+        # Email can come back as a string or as a nested object.
+        email_field = resp.get("email")
+        if isinstance(email_field, dict):
+            email = email_field.get("email") or email_field.get("value") or ""
+        else:
+            email = email_field or ""
+        if not email:
+            emails = resp.get("emails") or []
+            if emails and isinstance(emails[0], dict):
+                email = emails[0].get("email", "")
+            elif emails:
+                email = emails[0]
+        if email:
+            return email
+    return ""
+
+
 def prospeo_domain_search(domain: str) -> dict:
     """
-    Call Prospeo domain-search API.
-    Returns:
-      - company_name: verified company name from Prospeo
-      - contacts: list of all people with target job titles
-      - raw_emails: all emails found (regardless of title)
+    NEW Prospeo API flow (old /domain-search was removed March 2026):
+      1. /search-person  -> people at this domain filtered by target titles
+      2. /search-company -> verified company name (with person fallback)
+      3. /enrich-person  -> verified email for each matched person
     """
     if not domain:
         return {}
 
-    headers = {
-        "Content-Type": "application/json",
-        "X-KEY": PROSPEO_API_KEY,
-    }
-    # Try both payload formats Prospeo supports
-    payloads_to_try = [
-        {"url": domain},
-        {"domain": domain},
-        {"url": domain, "limit": 50},
-        {"domain": domain, "limit": 50},
+    titles_proper = [
+        "Founder", "Owner", "Co-Founder", "President",
+        "Co-Owner", "VP of Marketing", "Marketing Director",
     ]
 
-    data = None
-    for payload in payloads_to_try:
-        try:
-            resp = requests.post(
-                f"{PROSPEO_API_URL}/domain-search",
-                headers=headers,
-                json=payload,
-                timeout=15
-            )
-            data = resp.json()
-            if resp.status_code == 200 and not data.get("error"):
-                break  # success
-            else:
-                print(f"  [prospeo] Trying next format... ({data.get('message', resp.status_code)})")
-                data = None
-        except Exception as e:
-            print(f"  [prospeo] Request failed: {e}")
-            data = None
+    # Step 1: find people at this company with the target job titles.
+    person_variants = [
+        {"page": 1, "filters": {
+            "company": {"domains": {"include": [domain]}},
+            "person_job_title": {"include": titles_proper},
+        }},
+        {"page": 1, "filters": {
+            "company": {"domains": {"include": [domain]}},
+        }},
+    ]
+    people = []
+    for body in person_variants:
+        data = _prospeo_post("/search-person", body)
+        if data is not None:
+            people = data.get("results") or []
+            if people:
+                break
 
-    if not data:
-        # Last resort: print raw response for debugging
-        try:
-            resp = requests.post(
-                f"{PROSPEO_API_URL}/domain-search",
-                headers=headers,
-                json={"url": domain},
-                timeout=15
-            )
-            print(f"  [prospeo] Raw response ({resp.status_code}): {resp.text[:300]}")
-        except Exception:
-            pass
-        return {}
+    # Step 2: verified company name.
+    company_name = prospeo_find_company_name(domain, people)
 
-    response = data.get("response", {})
-
-    # Extract verified company name
-    company_info = response.get("company", {})
-    company_name = (
-        company_info.get("name") or
-        company_info.get("organization") or
-        response.get("organization") or
-        ""
-    )
-
-    # Extract all people, filter by target job titles
-    email_list = (
-        response.get("emails") or
-        response.get("people") or
-        response.get("contacts") or
-        []
-    )
+    # Step 3: filter by target title + enrich for email.
     matched_contacts = []
-    all_emails = []
-
-    for person in email_list:
-        email = person.get("email", "")
-        title = (
-            person.get("position") or
-            person.get("title") or
-            person.get("job_title") or
-            ""
+    for person in people:
+        p = person.get("person", person)
+        title = p.get("current_job_title") or p.get("headline") or ""
+        if not (title and is_target_title(title)):
+            continue
+        full_name = p.get("full_name") or (
+            f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
         )
-        first = person.get("first_name", "") or person.get("firstName", "")
-        last = person.get("last_name", "") or person.get("lastName", "")
-        linkedin = (
-            person.get("linkedin") or
-            person.get("linkedin_url") or
-            person.get("linkedin_profile") or
-            ""
-        )
-        full_name = f"{first} {last}".strip() or person.get("name", "")
-
-        if email:
-            all_emails.append(email)
-
-        if title and is_target_title(title):
-            matched_contacts.append(Contact(
-                name=full_name,
-                title=title,
-                email=email,
-                linkedin=linkedin,
-            ))
+        linkedin = p.get("linkedin_url") or ""
+        email = prospeo_enrich_email(person)
+        matched_contacts.append(Contact(
+            name=full_name,
+            title=title,
+            email=email,
+            linkedin=linkedin,
+        ))
 
     return {
         "company_name": company_name,
         "matched_contacts": matched_contacts,
-        "all_emails": all_emails,
-        "total": response.get("total", len(email_list)),
+        "total": len(people),
     }
-
-    except Exception as e:
-        print(f"  [prospeo] Request failed: {e}")
-        return {}
 
 
 def validate_with_claude(brand_name: str, website_candidate: str) -> dict:
