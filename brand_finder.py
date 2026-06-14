@@ -12,6 +12,7 @@ Brand Finder — full enrichment pipeline:
 import time, json, re, random, sys, argparse, csv, os
 from dataclasses import dataclass, asdict
 from typing import Optional
+from urllib.parse import quote_plus
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -78,6 +79,15 @@ class BrandResult:
     owner_linkedin_title: str = NO_INFO   # which title query found the profile
     # Prospeo enrichment
     owner_email_prospeo: str = NO_INFO
+    # ── Stage D — no-website fallback (Amazon-only brands) ──────────────────
+    amazon_seller_contact: str = NO_INFO    # phone/email shown on seller page
+    customs_importer_name: str = NO_INFO    # US importer of record (customs)
+    contact_source: str = NO_INFO           # amazon_seller | customs | registry | tsdr
+    manual_amazon_url: str = NO_INFO        # human: check INFORM Act seller info
+    manual_importyeti_url: str = NO_INFO    # human: free import-records lookup
+    manual_registry_url: str = NO_INFO      # human: company registry search
+    manual_tsdr_url: str = NO_INFO          # human: USPTO TSDR (correspondent email)
+    status: str = NO_INFO                   # resolved|manual_lookup_needed|offshore_no_contact|not_found
     # Meta
     notes: str = ""
 
@@ -842,29 +852,339 @@ def _enrich_person_for_email(person: dict) -> str:
     return _extract_email_from_enrich(edata)
 
 
+# ── STAGE D — no-website fallback (Amazon-only brands) ────────────────────────
+# Runs only for brands the earlier stages could not resolve (no website AND/OR
+# no owner name). It collects BUSINESS contact info via compliant channels and,
+# for anything it can't auto-resolve, leaves a human a ready-made set of lookup
+# URLs in manual_worklist.csv. It NEVER scrapes amazon.com / importyeti.com /
+# tsdr directly, and NEVER guesses or pattern-generates an email address.
+
+# Countries with no usable public owner registry → tag and stop (don't chase a
+# person or an email for these).
+OFFSHORE_COUNTRY_CODES = {
+    "CN", "CHINA", "HONG KONG", "HK", "AE", "UAE", "UNITED ARAB EMIRATES",
+    "VN", "VIETNAM", "PK", "PAKISTAN", "BD", "BANGLADESH",
+}
+# Countries we can bridge to an owner via a public registry.
+REGISTRY_URLS = {
+    "US": "https://opencorporates.com/companies/us?q={q}",
+    "GB": "https://find-and-update.company-information.service.gov.uk/search/companies?q={q}",
+    "UK": "https://find-and-update.company-information.service.gov.uk/search/companies?q={q}",
+    "CA": "https://opencorporates.com/companies/ca?q={q}",
+    "AU": "https://opencorporates.com/companies/au?q={q}",
+}
+DEFAULT_REGISTRY_URL = "https://opencorporates.com/companies?q={q}"
+
+
+def _detect_country(address: str) -> str:
+    """Best-effort country code from a seller/importer address ('' if unknown)."""
+    if not address or address == NO_INFO:
+        return ""
+    upper = address.upper()
+    if re.search(r'[一-鿿぀-ヿ가-힯]', address):
+        return "CN"
+    if re.search(r',\s*(US|USA|UNITED STATES)\b\.?\s*$', upper):
+        return "US"
+    if re.search(r'\b[A-Z]{2}\s*,?\s*\d{5}(-\d{4})?\b', upper):
+        return "US"
+    last = upper.split(",")[-1].strip().rstrip(".")
+    aliases = {
+        "USA": "US", "UNITED STATES": "US", "UNITED KINGDOM": "GB",
+        "ENGLAND": "GB", "UNITED ARAB EMIRATES": "AE", "HONG KONG": "HK",
+    }
+    code = aliases.get(last, last)
+    if 2 <= len(code) <= 14:
+        return code
+    return ""
+
+
+def _is_offshore(*addresses: str) -> bool:
+    """True if any address clearly resolves to a no-registry offshore country."""
+    for a in addresses:
+        c = _detect_country(a)
+        if c and c in OFFSHORE_COUNTRY_CODES:
+            return True
+    return False
+
+
+def _registry_url(country: str, name: str) -> str:
+    tmpl = REGISTRY_URLS.get(country.upper(), DEFAULT_REGISTRY_URL)
+    return tmpl.format(q=quote_plus(name))
+
+
+# ── D1: Amazon seller business info (INFORM Act) via DDG snippets ─────────────
+def stage_d1_amazon_seller(brand: str) -> dict:
+    """
+    Find the seller / legal business name + address from Amazon's INFORM Act
+    disclosure WITHOUT scraping amazon.com. We read DuckDuckGo snippets of the
+    'sold by' page and (if available) let Claude extract the business name.
+    Always returns a manual_amazon_url for a human to verify.
+    """
+    out = {"seller_name": NO_INFO, "seller_address": NO_INFO, "seller_contact": NO_INFO,
+           "manual_amazon_url": f"https://www.amazon.com/s?k={quote_plus(brand)}"}
+    print(f"    [D1] Amazon seller (INFORM Act) via search snippets...")
+    snippets = []
+    for q in (f'site:amazon.com "{brand}" sold by',
+              f'amazon.com "{brand}" "Business Name"',
+              f'amazon.com seller "{brand}"'):
+        for h in ddg(q, n=6):
+            body = (h.get("title", "") + " " + h.get("body", "")).strip()
+            if body:
+                snippets.append(body)
+        if snippets:
+            break
+    if not snippets:
+        print(f"    [D1] No seller snippets found — manual_amazon_url stored")
+        return out
+
+    blob = "\n".join(snippets)[:3000]
+    if HAS_CLAUDE:
+        answer = claude_ask(
+            f'These are search-result snippets about the Amazon seller for the brand '
+            f'"{brand}":\n\n{blob}\n\n'
+            f'Extract the seller/legal business NAME and any business ADDRESS shown. '
+            f'Reply ONLY JSON: {{"name":"...","address":"..."}}. '
+            f'Use "" for anything not present.'
+        )
+        try:
+            p = json.loads(re.search(r'\{.*\}', answer, re.DOTALL).group())
+            if p.get("name"):
+                out["seller_name"] = p["name"].strip()
+                print(f"    [D1] Seller business name: {out['seller_name']}")
+            if p.get("address"):
+                out["seller_address"] = p["address"].strip()
+                print(f"    [D1] Seller address: {out['seller_address'][:60]}")
+        except Exception:
+            print(f"    [D1] Could not parse seller info — manual_amazon_url stored")
+    else:
+        # No Claude: try a plain-text 'Business Name' match in the snippets
+        m = re.search(r'Business [Nn]ame[:\s]*([^\n.;|]{2,80})', blob)
+        if m:
+            out["seller_name"] = m.group(1).strip()
+            print(f"    [D1] Seller business name: {out['seller_name']}")
+    return out
+
+
+# ── D2: Customs / import records ──────────────────────────────────────────────
+def stage_d2_customs(brand: str, entity_name: str) -> dict:
+    """
+    Query ImportGenius / Panjiva by brand and entity IF an API key is present in
+    the environment. Never scrapes importyeti.com — always returns a free manual
+    ImportYeti search URL for a human.
+    """
+    out = {"importer_name": NO_INFO, "importer_address": NO_INFO,
+           "manual_importyeti_url": f"https://www.importyeti.com/search?q={quote_plus(brand)}"}
+    ig_key = os.environ.get("IMPORTGENIUS_API_KEY")
+    pj_key = os.environ.get("PANJIVA_API_KEY")
+    if not (ig_key or pj_key):
+        print(f"    [D2] No customs API key set — manual_importyeti_url stored")
+        return out
+
+    terms = list(dict.fromkeys(x for x in [brand, entity_name] if x and x != NO_INFO))
+    for term in terms:
+        try:
+            if ig_key:
+                resp = requests.get(
+                    "https://api.importgenius.com/v1/shipments",
+                    params={"q": term, "limit": 5},
+                    headers={"Authorization": f"Bearer {ig_key}"}, timeout=20,
+                )
+            else:
+                resp = requests.get(
+                    "https://api.panjiva.com/v1/shipments",
+                    params={"q": term}, headers={"Authorization": f"Bearer {pj_key}"},
+                    timeout=20,
+                )
+            if resp.status_code != 200:
+                continue
+            rows = (resp.json().get("data") or resp.json().get("shipments") or [])
+            if rows:
+                row = rows[0]
+                out["importer_name"] = (row.get("consignee_name")
+                                        or row.get("importer") or NO_INFO)
+                out["importer_address"] = (row.get("consignee_address")
+                                           or row.get("importer_address") or NO_INFO)
+                print(f"    [D2] Importer of record: {out['importer_name']}")
+                break
+        except Exception as e:
+            print(f"    [D2] customs API error: {e}")
+        delay(1, 2)
+    return out
+
+
+# ── D3: Registry bridge — business name → owner ──────────────────────────────
+def stage_d3_registry(brand: str, business_name: str, country: str) -> dict:
+    """
+    Feed a real business name back into the existing owner-resolution logic
+    (USPTO here) to fill an owner name, and always build a registry search URL
+    for the detected country so a human can finish the lookup.
+    """
+    out = {"owner_first": NO_INFO, "owner_last": NO_INFO,
+           "manual_registry_url": NO_INFO}
+    name = business_name if (business_name and business_name != NO_INFO) else brand
+    out["manual_registry_url"] = _registry_url(country or "US", name)
+    print(f"    [D3] Registry bridge for '{name}' ({country or 'US'})")
+    if business_name and business_name != NO_INFO and is_us_address(""):
+        tm = uspto_find_owner(brand, business_name)
+        if tm["trademark_owner_first_name"] != NO_INFO:
+            out["owner_first"] = tm["trademark_owner_first_name"]
+            out["owner_last"] = tm["trademark_owner_last_name"]
+            print(f"    [D3] Owner via registry bridge: "
+                  f"{out['owner_first']} {out['owner_last']}")
+    return out
+
+
+# ── D4: Trademark correspondent email (TSDR URL only) ────────────────────────
+def uspto_find_serial(brand: str, business_name: str) -> str:
+    """Return the trademark serial number for TSDR, or '' if none found."""
+    for term in dict.fromkeys(x for x in [business_name, brand] if x and x != NO_INFO):
+        try:
+            resp = requests.get(
+                "https://efts.uspto.gov/LATEST/search-efts",
+                params={"q": f'"{term}"', "df": "mark_identification", "f": "json"},
+                headers=BROWSER_HEADERS, timeout=15,
+            )
+            if resp.status_code != 200:
+                continue
+            hits = (resp.json().get("hits") or {}).get("hits") or []
+            if hits:
+                src = hits[0].get("_source", {})
+                serial = (src.get("serial_number") or hits[0].get("_id") or "")
+                if serial:
+                    return str(serial)
+        except Exception:
+            continue
+    return ""
+
+
+def stage_d4_tsdr(brand: str, business_name: str) -> str:
+    """
+    Build the TSDR URL for a known trademark serial. The trademark application's
+    correspondent email sometimes appears in TSDR documents — but we never
+    auto-scrape TSDR; we hand the URL to a human.
+    """
+    serial = uspto_find_serial(brand, business_name)
+    if not serial:
+        print(f"    [D4] No trademark serial found — no TSDR URL")
+        return NO_INFO
+    url = (f"https://tsdr.uspto.gov/#caseNumber={serial}"
+           f"&caseType=SERIAL_NO&searchType=documentSearch")
+    print(f"    [D4] TSDR (correspondent email may appear here): serial {serial}")
+    return url
+
+
+def stage_d_fallback(r: "BrandResult", brand: str):
+    """
+    No-website fallback orchestrator (D1→D4). Mutates `r` in place and sets its
+    final `status`. Only meaningful business contact info is collected; emails
+    are never guessed. Offshore entities are tagged and we stop.
+    """
+    print(f"  STAGE D: no-website fallback (Amazon-only brand)")
+
+    # D1 — Amazon seller business info (INFORM Act)
+    d1 = stage_d1_amazon_seller(brand)
+    if r.amazon_seller_name == NO_INFO and d1["seller_name"] != NO_INFO:
+        r.amazon_seller_name = d1["seller_name"]
+    if r.amazon_seller_address == NO_INFO and d1["seller_address"] != NO_INFO:
+        r.amazon_seller_address = d1["seller_address"]
+    r.amazon_seller_contact = d1["seller_contact"]
+    r.manual_amazon_url = d1["manual_amazon_url"]
+    if r.amazon_seller_name != NO_INFO and r.contact_source == NO_INFO:
+        r.contact_source = "amazon_seller"
+
+    entity = r.amazon_seller_name if r.amazon_seller_name != NO_INFO else ""
+
+    # D2 — Customs / import records
+    delay(1, 2)
+    d2 = stage_d2_customs(brand, entity)
+    r.customs_importer_name = d2["importer_name"]
+    r.manual_importyeti_url = d2["manual_importyeti_url"]
+    if d2["importer_name"] != NO_INFO and not entity:
+        entity = d2["importer_name"]
+    if d2["importer_name"] != NO_INFO and r.contact_source == NO_INFO:
+        r.contact_source = "customs"
+
+    # Offshore check — tag and stop (no public owner registry to chase)
+    if _is_offshore(r.amazon_seller_address, d2.get("importer_address", "")):
+        r.status = "offshore_no_contact"
+        r.notes = (r.notes + "; offshore entity, no owner registry").lstrip("; ")
+        print(f"    [D] Offshore entity detected → status=offshore_no_contact")
+        return
+
+    country = _detect_country(r.amazon_seller_address) or "US"
+
+    # D3 — Registry bridge (business name → owner)
+    delay(1, 2)
+    d3 = stage_d3_registry(brand, entity, country)
+    r.manual_registry_url = d3["manual_registry_url"]
+    if r.trademark_owner_first_name == NO_INFO and d3["owner_first"] != NO_INFO:
+        r.trademark_owner_first_name = d3["owner_first"]
+        r.trademark_owner_last_name = d3["owner_last"]
+        r.contact_source = "registry"
+        r.notes = (r.notes + "; owner via registry bridge").lstrip("; ")
+
+    # D4 — Trademark correspondent (TSDR URL only)
+    delay(1, 2)
+    r.manual_tsdr_url = stage_d4_tsdr(brand, entity)
+    if r.manual_tsdr_url != NO_INFO and r.contact_source == NO_INFO:
+        r.contact_source = "tsdr"
+
+    # Final status for this fallback brand
+    has_owner = r.trademark_owner_first_name != NO_INFO
+    has_contact = (r.contact_email != NO_INFO or r.amazon_seller_name != NO_INFO
+                   or r.customs_importer_name != NO_INFO)
+    if has_owner and has_contact:
+        r.status = "resolved"
+    elif any(u != NO_INFO for u in (r.manual_amazon_url, r.manual_importyeti_url,
+                                    r.manual_registry_url, r.manual_tsdr_url)):
+        r.status = "manual_lookup_needed"
+    else:
+        r.status = "not_found"
+    print(f"    [D] status={r.status}")
+
+
 # ── Save ──────────────────────────────────────────────────────────────────────
 CSV_FIELDS = [
     "input_brand",
     "amazon_search_url", "amazon_product_url",
-    "amazon_seller_name", "amazon_seller_address",
+    "amazon_seller_name", "amazon_seller_address", "amazon_seller_contact",
+    "customs_importer_name",
     "official_website",
-    "contact_email", "contact_form_url",
+    "contact_email", "contact_form_url", "contact_source",
     "trademark_owner_first_name", "trademark_owner_last_name",
     "company_linkedin_url",
     "owner_linkedin_url", "owner_linkedin_title",
     "owner_email_prospeo",
+    "manual_amazon_url", "manual_importyeti_url",
+    "manual_registry_url", "manual_tsdr_url",
+    "status",
     "notes",
+]
+
+MANUAL_FIELDS = [
+    "input_brand",
+    "manual_amazon_url", "manual_importyeti_url",
+    "manual_registry_url", "manual_tsdr_url",
 ]
 
 
 def save_results(results: list, output_file: str):
+    rows = [asdict(r) for r in results]
     with open(output_file, "w") as f:
-        json.dump([asdict(r) for r in results], f, indent=2)
+        json.dump(rows, f, indent=2)
     csv_file = output_file.replace(".json", ".csv")
     with open(csv_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows([asdict(r) for r in results])
+        writer.writerows(rows)
+
+    # Second CSV: only the rows a human still needs to finish, with their URLs.
+    manual_file = os.path.join(os.path.dirname(csv_file) or ".", "manual_worklist.csv")
+    manual_rows = [row for row in rows if row.get("status") == "manual_lookup_needed"]
+    with open(manual_file, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=MANUAL_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(manual_rows)
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -947,6 +1267,15 @@ def process_brands(brands: list, output_file: str = "results.json") -> list:
             brand, biz,
         )
 
+        # ── Stage D — no-website fallback for Amazon-only brands ─────────────
+        # Trigger when Stages A–C couldn't resolve a website OR an owner name.
+        no_website = r.official_website == NO_INFO
+        no_owner = r.trademark_owner_first_name == NO_INFO
+        if no_website or no_owner:
+            stage_d_fallback(r, brand)
+        else:
+            r.status = "resolved"
+
         results.append(r)
         save_results(results, output_file)
         print(f"\n  ✓ Saved after brand {i}")
@@ -970,8 +1299,41 @@ def print_summary(results: list):
         print(f"  Company LinkedIn   : {r.company_linkedin_url}")
         print(f"  Owner LinkedIn     : {r.owner_linkedin_url} ({r.owner_linkedin_title})")
         print(f"  Owner email        : {r.owner_email_prospeo}")
+        print(f"  Status             : {r.status}")
+        if r.customs_importer_name != NO_INFO:
+            print(f"  Customs importer   : {r.customs_importer_name}")
+        if r.status == "manual_lookup_needed":
+            print(f"  Manual Amazon      : {r.manual_amazon_url}")
+            print(f"  Manual ImportYeti  : {r.manual_importyeti_url}")
+            print(f"  Manual Registry    : {r.manual_registry_url}")
+            print(f"  Manual TSDR        : {r.manual_tsdr_url}")
         if r.notes:
             print(f"  Notes              : {r.notes}")
+
+
+def print_fill_rates(results: list):
+    """Per-field fill rate (non 'No Info') and a count per status."""
+    if not results:
+        return
+    n = len(results)
+    print(f"\n{'='*70}\nFILL-RATE PER FIELD  (out of {n} brand(s))\n{'='*70}")
+    fields = [
+        "amazon_seller_name", "amazon_seller_address", "customs_importer_name",
+        "official_website", "contact_email", "contact_source",
+        "trademark_owner_first_name", "company_linkedin_url",
+        "owner_linkedin_url", "owner_email_prospeo",
+    ]
+    for fld in fields:
+        filled = sum(1 for r in results if getattr(r, fld, NO_INFO) not in (NO_INFO, ""))
+        pct = 100 * filled / n
+        print(f"  {fld:<28} {filled:>3}/{n}  ({pct:5.1f}%)")
+
+    print(f"\n{'='*70}\nCOUNT PER STATUS\n{'='*70}")
+    counts = {}
+    for r in results:
+        counts[r.status] = counts.get(r.status, 0) + 1
+    for status, c in sorted(counts.items(), key=lambda kv: -kv[1]):
+        print(f"  {status:<24} {c}")
 
 
 def main():
@@ -992,9 +1354,13 @@ def main():
     print(f"Processing {len(brands)} brand(s)...")
     results = process_brands(brands, output_file=args.output)
     print_summary(results)
+    print_fill_rates(results)
     csv_file = args.output.replace(".json", ".csv")
+    manual_file = os.path.join(os.path.dirname(csv_file) or ".", "manual_worklist.csv")
+    manual_n = sum(1 for r in results if r.status == "manual_lookup_needed")
     print(f"\nSaved to    : {args.output}")
     print(f"Spreadsheet : {csv_file}  ← open in Excel or Numbers")
+    print(f"Worklist    : {manual_file}  ← {manual_n} brand(s) need a manual check")
 
 
 if __name__ == "__main__":
