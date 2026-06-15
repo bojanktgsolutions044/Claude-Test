@@ -32,7 +32,9 @@ Gmail:
 
 Slack:
 - `slack_send_message` — post the final summary to the **#updates** channel
-  (`channel_id: C0APKTSF7LY`).
+  (`channel_id: C0APKTSF7LY`). Capture the returned `message_ts`, then post a
+  **threaded reply** (pass `thread_ts: <that message_ts>`) that tags
+  `<@U03UD9796F6>` (Bojan Stojkovikj) and `<@U03V0GYAVT2>` (Dejan Petrovski).
 
 ## Steps
 
@@ -42,13 +44,16 @@ Slack:
 3. For each thread (up to the count limit), call `get_thread` and read the
    latest message. Extract: sender, subject, date, and the key ask/point.
 4. Write a **1–2 sentence summary** of each thread.
-5. Decide if a reply is warranted. Skip pure newsletters, receipts, automated
-   no-reply notifications, and promotions — note them as "no reply needed".
-6. For each thread that warrants a reply, draft a **short, friendly, 2–4
-   sentence** response in the user's voice. Keep it neutral and professional;
-   do not invent facts, commitments, dates, numbers, or attachments. If a reply
-   needs info you don't have, write a brief holding reply and flag what's
-   missing.
+5. Decide if a reply is warranted. **Only draft a reply when the sender states
+   that the invoice has been paid or will be paid** (e.g. "payment processed",
+   "paid invoice #X", "payment sent/wired", "I'll pay/process it on <day>").
+   For everything else — questions about how/where to pay, requests for account
+   details, status inquiries, automated no-reply notices, newsletters, receipts,
+   promotions — **do not draft**; note them as "No draft (reason)".
+6. For each qualifying thread, draft a **short, friendly, 2–4 sentence**
+   acknowledgement in the user's voice (thank them / confirm you'll watch for
+   the funds). Keep it neutral and professional; do not invent facts,
+   commitments, dates, numbers, or attachments.
 7. Create the draft with `create_draft` (reply-threaded as described above).
    **Never send.**
 
@@ -67,10 +72,14 @@ Build a compact summary in this shape:
 > _Total reviewed: N · Drafts created: M · Drafts await your review in Gmail._
 
 Then do BOTH:
-1. **Post it to Slack**: call `slack_send_message` with `channel_id: C0APKTSF7LY`
-   (the **#updates** channel) and the summary above as the message (Slack
-   markdown). If there is nothing unread, post a brief "Inbox zero — nothing
-   unread" line instead.
+1. **Post it to Slack as a thread**: call `slack_send_message` with
+   `channel_id: C0APKTSF7LY` (the **#updates** channel) and the summary above as
+   the parent message — include the **date and time checked** in the header.
+   Capture the returned `message_ts`, then post a **threaded reply**
+   (`thread_ts: <message_ts>`) that tags `<@U03UD9796F6>` (Bojan) and
+   `<@U03V0GYAVT2>` (Dejan) with a one-line note that the drafts await review.
+   If there is nothing unread, still post a brief "Inbox zero — nothing unread"
+   parent with the checked time, plus the tagged thread reply.
 2. Print the same summary in the chat reply.
 
 ## Guardrails
