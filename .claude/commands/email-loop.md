@@ -31,10 +31,12 @@ Gmail:
   that message's sender (reply-to / From address).
 
 Slack:
-- `slack_send_message` — post the final summary to the **#updates** channel
-  (`channel_id: C0APKTSF7LY`). Capture the returned `message_ts`, then post a
-  **threaded reply** (pass `thread_ts: <that message_ts>`) that tags
-  `<@U03UD9796F6>` (Bojan Stojkovikj) and `<@U03V0GYAVT2>` (Dejan Petrovski).
+- `slack_send_message` — post to the **#updates** channel (`channel_id:
+  C0APKTSF7LY`). The **parent message is only the title + date/time**:
+  `📬 Email digest — <date/time UTC>`. Capture the returned `message_ts`, then
+  put the **entire summary in a threaded reply** (`thread_ts: <message_ts>`)
+  that also tags `<@U03UD9796F6>` (Bojan Stojkovikj) and `<@U03V0GYAVT2>`
+  (Dejan Petrovski).
 
 ## Steps
 
@@ -59,28 +61,25 @@ Slack:
 
 ## Output
 
-Build a compact summary in this shape:
+Post to Slack as a **two-level thread**:
 
-> **📬 Email digest — <date/time>**
->
-> | # | From | Subject | Summary | Action |
-> |---|------|---------|---------|--------|
->
-> - **#** thread index
-> - **Action**: `Draft created` / `No reply needed (reason)`
->
-> _Total reviewed: N · Drafts created: M · Drafts await your review in Gmail._
+1. **Parent message — title only:** `📬 Email digest — <date/time UTC>`
+   (no summary, no table here). Capture the returned `message_ts`.
+2. **Threaded reply (`thread_ts: <message_ts>`)** — tag both reviewers on the
+   first line, then the full summary:
 
-Then do BOTH:
-1. **Post it to Slack as a thread**: call `slack_send_message` with
-   `channel_id: C0APKTSF7LY` (the **#updates** channel) and the summary above as
-   the parent message — include the **date and time checked** in the header.
-   Capture the returned `message_ts`, then post a **threaded reply**
-   (`thread_ts: <message_ts>`) that tags `<@U03UD9796F6>` (Bojan) and
-   `<@U03V0GYAVT2>` (Dejan) with a one-line note that the drafts await review.
-   If there is nothing unread, still post a brief "Inbox zero — nothing unread"
-   parent with the checked time, plus the tagged thread reply.
-2. Print the same summary in the chat reply.
+   > `<@U03UD9796F6>` `<@U03V0GYAVT2>`
+   >
+   > | From | Client | Status | Action |
+   > |------|--------|--------|--------|
+   >
+   > - **Action**: `Draft created` / `No draft (reason)`
+   >
+   > _Total reviewed: N · Drafts created: M · Drafts await review in Gmail — nothing sent._
+
+   If there is nothing unread, the threaded reply is just the tags + a brief
+   "Inbox zero — nothing unread" line.
+3. Also print the same summary in the chat reply.
 
 ## Guardrails
 
