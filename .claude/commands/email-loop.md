@@ -20,16 +20,19 @@ Default Gmail search query: `is:unread in:inbox`
 
 ## Tools
 
-Use the connected **Gmail** MCP tools (the server whose tools include
-`search_threads`, `get_thread`, `create_draft`, `list_drafts`). The MCP server
-prefix is a dynamic ID, so match by the tool's short name, not a hardcoded
-prefix:
+Use the connected **Gmail** and **Slack** MCP tools. The MCP server prefix is a
+dynamic ID, so match by the tool's short name, not a hardcoded prefix:
 
+Gmail:
 - `search_threads` — find unread threads (pass the query above; `pageSize` ≈ the requested count).
 - `get_thread` — fetch full content of each thread (use `messageFormat: FULL_CONTENT`).
 - `create_draft` — create a reply draft. Pass `replyToMessageId` = the ID of the
   latest message in the thread so the draft threads correctly, and set `to` to
   that message's sender (reply-to / From address).
+
+Slack:
+- `slack_send_message` — post the final summary to the **#updates** channel
+  (`channel_id: C0APKTSF7LY`).
 
 ## Steps
 
@@ -51,16 +54,24 @@ prefix:
 
 ## Output
 
-Print a compact summary table, then list what you drafted:
+Build a compact summary in this shape:
 
-| # | From | Subject | Summary | Action |
-|---|------|---------|---------|--------|
+> **📬 Email digest — <date/time>**
+>
+> | # | From | Subject | Summary | Action |
+> |---|------|---------|---------|--------|
+>
+> - **#** thread index
+> - **Action**: `Draft created` / `No reply needed (reason)`
+>
+> _Total reviewed: N · Drafts created: M · Drafts await your review in Gmail._
 
-- **#** thread index
-- **Action**: `Draft created` / `No reply needed (reason)`
-
-End with a one-line note: total threads reviewed, drafts created, and a reminder
-that drafts are in Gmail awaiting the user's review/edit before sending.
+Then do BOTH:
+1. **Post it to Slack**: call `slack_send_message` with `channel_id: C0APKTSF7LY`
+   (the **#updates** channel) and the summary above as the message (Slack
+   markdown). If there is nothing unread, post a brief "Inbox zero — nothing
+   unread" line instead.
+2. Print the same summary in the chat reply.
 
 ## Guardrails
 
