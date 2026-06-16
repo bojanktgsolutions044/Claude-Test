@@ -44,14 +44,21 @@ Slack:
 2. If there are no unread threads, tell the user "Inbox zero — nothing unread"
    and stop.
 3. For each thread (up to the count limit), call `get_thread` and read the
-   latest message. Extract: sender, subject, date, and the key ask/point.
+   latest message. Extract: sender **name**, sender **email**, subject, date,
+   and the key ask/point.
 4. Write a **1–2 sentence summary** of each thread.
-5. Decide if a reply is warranted. **Only draft a reply when the sender states
-   that the invoice has been paid or will be paid** (e.g. "payment processed",
-   "paid invoice #X", "payment sent/wired", "I'll pay/process it on <day>").
-   For everything else — questions about how/where to pay, requests for account
-   details, status inquiries, automated no-reply notices, newsletters, receipts,
-   promotions — **do not draft**; note them as "No draft (reason)".
+5. Classify each sender into exactly one bucket (use the latest inbound message):
+   - **Paid** — states the invoice was paid/sent/wired/processed.
+   - **Will pay** — promises to pay on a date or shortly.
+   - **Change payment method** — can't pay via the current method, or asks to
+     use / confirm a different one (e.g. Wise not working, asks for WiseTag,
+     phone, business name, Apple Pay, etc.).
+   - **Requested hourly breakdown / tracker** — asks for an hourly breakdown,
+     time log, or tracker to be sent.
+   - **Other** — status inquiries, automated no-reply notices, newsletters,
+     receipts, promotions, anything else.
+   A reply is warranted **only for Paid and Will pay** senders → draft those.
+   For all other buckets, **do not draft**.
 6. For each qualifying thread, draft a **short, friendly, 2–4 sentence**
    acknowledgement in the user's voice (thank them / confirm you'll watch for
    the funds). Keep it neutral and professional; do not invent facts,
@@ -66,16 +73,24 @@ Post to Slack as a **two-level thread**:
 1. **Parent message — title only:** `📬 Email digest — <date/time UTC>`
    (no summary, no table here). Capture the returned `message_ts`.
 2. **Threaded reply (`thread_ts: <message_ts>`)** — tag both reviewers on the
-   first line, then the full summary:
+   first line, then an **Overview** (counts) followed by a **per-sender
+   breakdown** grouped by bucket:
 
    > `<@U03UD9796F6>` `<@U03V0GYAVT2>`
    >
-   > | From | Client | Status | Action |
-   > |------|--------|--------|--------|
+   > **📊 Overview**
+   > • 💰 Paid: **N**
+   > • 🕒 Will pay soon: **N**
+   > • 🔄 Want to change / confirm payment method: **N**
+   > • 🧾 Requested hourly breakdown / tracker: **N**
+   > • ℹ️ Other: **N**
    >
-   > - **Action**: `Draft created` / `No draft (reason)`
+   > Then, grouped under each bucket heading, list every sender as:
+   > `*Name* — Company — `email` — one-line summary of their message.`
+   > Mark the Paid / Will-pay groups as _(reply drafts ready in Gmail)_ and the
+   > others as _(no draft)_.
    >
-   > _Total reviewed: N · Drafts created: M · Drafts await review in Gmail — nothing sent._
+   > _Total reviewed: N · Drafts ready: M · All drafts await review in Gmail — nothing sent._
 
    If there is nothing unread, the threaded reply is just the tags + a brief
    "Inbox zero — nothing unread" line.
