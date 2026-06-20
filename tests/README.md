@@ -18,6 +18,11 @@ pytest
   driven by small synthetic HTML fixtures.
 - `test_output.py` — `BrandResult` defaults and `save_results` JSON/CSV output,
   including the manual-worklist split.
+- `test_network_mocked.py` — the network-coupled functions (`safe_get`, `ddg`,
+  `claude_ask`, `_prospeo_post`, `find_official_website`, `find_contact_info`,
+  `website_find_founder`) with the `requests` / DDG / Anthropic boundary mocked.
+  Asserts status handling, exception safety, fallback ordering, and parsing of
+  fetched content. `delay` is stubbed so the suite never sleeps.
 
 ## Not tests
 
@@ -26,8 +31,8 @@ assertions), deliberately kept out of `tests/` so pytest does not collect it.
 
 ## Known gaps (next layers)
 
-The network-coupled functions (`safe_get`, `ddg`, `claude_ask`, `_prospeo_post`
-and the stage orchestrators) are not yet covered. Testing them means mocking the
-`requests` / DDG / Anthropic boundary and asserting control flow (fallback
-ordering, graceful handling of `None` responses). That is the recommended next
-milestone.
+The remaining uncovered code is the higher-level pipeline orchestration —
+`process_brands`, `stage_d_fallback`, and the USPTO/TSDR/registry stages. These
+chain many of the now-tested helpers together; covering them means mocking the
+same boundary and asserting the multi-stage fallback logic and `BrandResult`
+field population end to end.
