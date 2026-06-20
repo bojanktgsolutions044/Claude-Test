@@ -3,3 +3,8 @@ __pycache__/
 results.json
 results.csv
 brands.txt
+.pytest_cache/
+.coverage
+htmlcov/
+venv/
+.venv/
