@@ -596,7 +596,7 @@ Reply with JSON only:
 SENIOR_TITLES = ["president", "ceo", "founder", "owner", "co-founder", "chief executive officer"]
 
 
-def find_apollo_organization_id(website: str, brand_name: str) -> Optional[str]:
+def find_apollo_organization(website: str, brand_name: str) -> Optional[dict]:
     """Look up an Apollo organization record by website domain (or brand name as fallback)."""
     if not APOLLO_API_KEY:
         return None
@@ -620,27 +620,21 @@ def find_apollo_organization_id(website: str, brand_name: str) -> Optional[str]:
 
     if resp.status_code in (401, 403, 429):
         print(f"  [apollo] organizations/search error {resp.status_code}: {resp.text[:300]}")
-        return "OUT_OF_CREDITS"
+        return {"_status": "Out of credits"}
     if resp.status_code != 200:
         print(f"  [apollo] organizations/search unexpected status {resp.status_code}: {resp.text[:300]}")
         return None
 
     orgs = resp.json().get("organizations", [])
-    return orgs[0]["id"] if orgs else None
+    return orgs[0] if orgs else None
 
 
-def find_apollo_contact(brand_name: str, website: str) -> dict:
+def find_apollo_contact(org_id: str) -> dict:
     """
-    Find a senior contact (president/CEO/founder/owner) for a brand via Apollo,
-    including email and phone number. Returns {} if nothing found.
+    Find a senior contact (president/CEO/founder/owner) for an Apollo
+    organization ID, including email and phone number. Returns {} if nothing found.
     """
-    if not HAS_REQUESTS or not APOLLO_API_KEY:
-        return {}
-
-    org_id = find_apollo_organization_id(website, brand_name)
-    if org_id == "OUT_OF_CREDITS":
-        return {"_status": "Out of credits"}
-    if not org_id:
+    if not HAS_REQUESTS or not APOLLO_API_KEY or not org_id:
         return {}
 
     headers = {"Content-Type": "application/json", "x-api-key": APOLLO_API_KEY}
@@ -733,6 +727,7 @@ def process_brands(brands: list, use_claude: bool = True, output_file: str = "re
                 print(f"  LinkedIn      : {linkedin_url}")
             random_delay(2, 3)
         else:
+            linkedin_url = ""
             print(f"  Website not found — trying Amazon seller lookup...")
             seller_info = find_seller_via_amazon(brand)
             if seller_info:
@@ -746,21 +741,38 @@ def process_brands(brands: list, use_claude: bool = True, output_file: str = "re
                 print(f"  No seller info found either.")
 
         if APOLLO_API_KEY:
-            print(f"  Looking up contact via Apollo...")
-            contact = find_apollo_contact(brand, result.official_website)
-            if contact.get("_status") == "Out of credits":
+            print(f"  Looking up organization via Apollo...")
+            org = find_apollo_organization(result.official_website, brand)
+
+            if org and org.get("_status") == "Out of credits":
                 result.contact_name = "Out of credits"
                 result.contact_title = "Out of credits"
                 result.contact_email = "Out of credits"
                 result.contact_phone = "Out of credits"
-            elif contact:
-                result.contact_name = contact.get("contact_name", "")
-                result.contact_title = contact.get("contact_title", "")
-                result.contact_email = contact.get("contact_email", "")
-                result.contact_phone = contact.get("contact_phone", "")
-                print(f"  Contact found : {result.contact_name} ({result.contact_title})")
+            elif org:
+                # Apollo's own org record often already has a LinkedIn URL —
+                # use it if our DuckDuckGo LinkedIn search came up empty.
+                if not result.company_linkedin_url and org.get("linkedin_url"):
+                    result.company_linkedin_url = org["linkedin_url"]
+                    print(f"  LinkedIn (Apollo): {result.company_linkedin_url}")
+
+                print(f"  Looking up contact via Apollo...")
+                contact = find_apollo_contact(org.get("id"))
+                if contact.get("_status") == "Out of credits":
+                    result.contact_name = "Out of credits"
+                    result.contact_title = "Out of credits"
+                    result.contact_email = "Out of credits"
+                    result.contact_phone = "Out of credits"
+                elif contact:
+                    result.contact_name = contact.get("contact_name", "")
+                    result.contact_title = contact.get("contact_title", "")
+                    result.contact_email = contact.get("contact_email", "")
+                    result.contact_phone = contact.get("contact_phone", "")
+                    print(f"  Contact found : {result.contact_name} ({result.contact_title})")
+                else:
+                    print(f"  No contact found via Apollo.")
             else:
-                print(f"  No contact found via Apollo.")
+                print(f"  No organization found via Apollo.")
 
         results.append(result)
 
