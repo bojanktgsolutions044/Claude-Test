@@ -60,6 +60,7 @@ class BrandResult:
     website_contact_email: str = ""
     website_contact_phone: str = ""
     company_linkedin_url: str = ""
+    linkedin_people: str = ""
 
 
 def random_delay(min_s=2.0, max_s=5.0):
@@ -405,6 +406,85 @@ def find_company_linkedin(brand_name: str) -> str:
     return ""
 
 
+# Senior titles worth surfacing as individual LinkedIn profiles, in priority order
+TARGET_PEOPLE_TITLES = [
+    "Owner", "Founder", "Co-Founder", "Co-Owner", "President",
+    "VP of Marketing", "Vice President of Marketing", "Marketing Director",
+]
+
+
+def extract_name_from_result_title(title: str) -> str:
+    """Pull just the person's name out of a search-result title like
+    'Giorgio Piccoli - President at Americanflat | LinkedIn'."""
+    for sep in (" - ", " | ", " :: ", " at "):
+        if sep in title:
+            return title.split(sep)[0].strip()
+    return title.strip()
+
+
+def find_linkedin_people(brand_name: str) -> list:
+    """
+    Find LinkedIn profile URLs for senior people at the brand (Owner, Founder,
+    Co-Founder, Co-Owner, President, VP/Director of Marketing).
+    Returns a list of {"name": ..., "title": ..., "url": ...} dicts.
+    """
+    found = {}  # title -> {"name", "title", "url"}
+
+    def record_match(result_title: str, url: str):
+        lower_title = result_title.lower()
+        for target in TARGET_PEOPLE_TITLES:
+            if target.lower() in lower_title and target not in found:
+                found[target] = {
+                    "name": extract_name_from_result_title(result_title),
+                    "title": target,
+                    "url": clean_url(url),
+                }
+
+    # Step 1: one broad search to catch as many matches as possible at once
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(f"{brand_name} People LinkedIn", max_results=15))
+        for r in results:
+            url = r.get("href", "")
+            if "linkedin.com/in/" not in url.lower():
+                continue
+            record_match(r.get("title", ""), url)
+    except Exception as e:
+        print(f"  [linkedin people search error] {e}")
+    random_delay(1, 2)
+
+    # Step 2: for any title still missing, search for it specifically
+    for title in TARGET_PEOPLE_TITLES:
+        if title in found:
+            continue
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(f"{brand_name} {title} LinkedIn", max_results=5))
+            for r in results:
+                url = r.get("href", "")
+                if "linkedin.com/in/" not in url.lower():
+                    continue
+                found[title] = {
+                    "name": extract_name_from_result_title(r.get("title", "")),
+                    "title": title,
+                    "url": clean_url(url),
+                }
+                break
+        except Exception as e:
+            print(f"  [linkedin {title} search error] {e}")
+        random_delay(1, 2)
+
+    # Return in priority order, deduplicated by URL
+    seen_urls = set()
+    ordered = []
+    for title in TARGET_PEOPLE_TITLES:
+        match = found.get(title)
+        if match and match["url"] not in seen_urls:
+            seen_urls.add(match["url"])
+            ordered.append(match)
+    return ordered
+
+
 def amazon_headers() -> dict:
     """Return headers that mimic a real browser to reduce Amazon blocking."""
     return {
@@ -726,6 +806,17 @@ def process_brands(brands: list, use_claude: bool = True, output_file: str = "re
             if linkedin_url:
                 print(f"  LinkedIn      : {linkedin_url}")
             random_delay(2, 3)
+
+            print(f"  Searching for key people on LinkedIn...")
+            people = find_linkedin_people(brand)
+            if people:
+                result.linkedin_people = "; ".join(
+                    f"{p['name']} ({p['title']}): {p['url']}" for p in people
+                )
+                for p in people:
+                    print(f"  {p['title']:<22}: {p['name']} — {p['url']}")
+            else:
+                print(f"  No senior LinkedIn profiles found.")
         else:
             linkedin_url = ""
             print(f"  Website not found — trying Amazon seller lookup...")
@@ -785,7 +876,8 @@ def process_brands(brands: list, use_claude: bool = True, output_file: str = "re
                 "input_brand", "amazon_search_url", "official_website",
                 "confidence", "notes", "seller_business_name", "seller_business_address",
                 "contact_name", "contact_title", "contact_email", "contact_phone",
-                "website_contact_email", "website_contact_phone", "company_linkedin_url"
+                "website_contact_email", "website_contact_phone", "company_linkedin_url",
+                "linkedin_people"
             ])
             writer.writeheader()
             writer.writerows([asdict(r) for r in results])
@@ -818,6 +910,8 @@ def print_summary(results: list):
             print(f"  Website phone : {r.website_contact_phone}")
         if r.company_linkedin_url:
             print(f"  LinkedIn      : {r.company_linkedin_url}")
+        if r.linkedin_people:
+            print(f"  Key people    : {r.linkedin_people}")
         print(f"  Confidence    : {r.confidence}")
         if r.notes:
             print(f"  Notes         : {r.notes}")
