@@ -5,6 +5,7 @@ and generates a direct Amazon search link for each brand.
 If no website is found, falls back to scraping Amazon for seller business info.
 """
 
+import os
 import time
 import json
 import re
@@ -16,6 +17,8 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 import warnings
 warnings.filterwarnings("ignore")
+
+APOLLO_API_KEY = os.environ.get("APOLLO_API_KEY", "")
 
 try:
     from ddgs import DDGS
@@ -50,6 +53,10 @@ class BrandResult:
     notes: str = ""
     seller_business_name: str = ""
     seller_business_address: str = ""
+    contact_name: str = ""
+    contact_title: str = ""
+    contact_email: str = ""
+    contact_phone: str = ""
 
 
 def random_delay(min_s=2.0, max_s=5.0):
@@ -516,6 +523,96 @@ Reply with JSON only:
     return {}
 
 
+SENIOR_TITLES = ["president", "ceo", "founder", "owner", "co-founder", "chief executive officer"]
+
+
+def find_apollo_organization_id(website: str, brand_name: str) -> Optional[str]:
+    """Look up an Apollo organization record by website domain (or brand name as fallback)."""
+    if not APOLLO_API_KEY:
+        return None
+
+    headers = {"Content-Type": "application/json", "x-api-key": APOLLO_API_KEY}
+    payload = {"page": 1, "per_page": 1}
+    if website:
+        domain = re.sub(r'https?://(www\.)?', '', website).split('/')[0]
+        payload["q_organization_domains"] = domain
+    else:
+        payload["q_organization_name"] = brand_name
+
+    try:
+        resp = requests.post(
+            "https://api.apollo.io/v1/organizations/search",
+            headers=headers, json=payload, timeout=15,
+        )
+    except Exception as e:
+        print(f"  [apollo] organizations/search failed: {e}")
+        return None
+
+    if resp.status_code in (401, 403, 429):
+        print(f"  [apollo] Out of credits")
+        return "OUT_OF_CREDITS"
+    if resp.status_code != 200:
+        return None
+
+    orgs = resp.json().get("organizations", [])
+    return orgs[0]["id"] if orgs else None
+
+
+def find_apollo_contact(brand_name: str, website: str) -> dict:
+    """
+    Find a senior contact (president/CEO/founder/owner) for a brand via Apollo,
+    including email and phone number. Returns {} if nothing found.
+    """
+    if not HAS_REQUESTS or not APOLLO_API_KEY:
+        return {}
+
+    org_id = find_apollo_organization_id(website, brand_name)
+    if org_id == "OUT_OF_CREDITS":
+        return {"_status": "Out of credits"}
+    if not org_id:
+        return {}
+
+    headers = {"Content-Type": "application/json", "x-api-key": APOLLO_API_KEY}
+    payload = {
+        "organization_ids": [org_id],
+        "person_titles": SENIOR_TITLES,
+        "page": 1,
+        "per_page": 1,
+        "contact_email_status": ["verified", "guessed"],
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.apollo.io/v1/mixed_people/search",
+            headers=headers, json=payload, timeout=15,
+        )
+    except Exception as e:
+        print(f"  [apollo] people search failed: {e}")
+        return {}
+
+    if resp.status_code in (401, 403, 429):
+        print(f"  [apollo] Out of credits")
+        return {"_status": "Out of credits"}
+    if resp.status_code != 200:
+        return {}
+
+    people = resp.json().get("people", [])
+    if not people:
+        return {}
+
+    person = people[0]
+    email = person.get("email", "")
+    if email == "email_not_unlocked@domain.com":
+        email = "Out of credits"
+
+    return {
+        "contact_name": person.get("name", ""),
+        "contact_title": person.get("title", ""),
+        "contact_email": email,
+        "contact_phone": (person.get("phone_numbers") or [{}])[0].get("raw_number", ""),
+    }
+
+
 def process_brands(brands: list, use_claude: bool = True, output_file: str = "results.json") -> list:
     results = []
 
@@ -560,6 +657,23 @@ def process_brands(brands: list, use_claude: bool = True, output_file: str = "re
             else:
                 print(f"  No seller info found either.")
 
+        if APOLLO_API_KEY:
+            print(f"  Looking up contact via Apollo...")
+            contact = find_apollo_contact(brand, result.official_website)
+            if contact.get("_status") == "Out of credits":
+                result.contact_name = "Out of credits"
+                result.contact_title = "Out of credits"
+                result.contact_email = "Out of credits"
+                result.contact_phone = "Out of credits"
+            elif contact:
+                result.contact_name = contact.get("contact_name", "")
+                result.contact_title = contact.get("contact_title", "")
+                result.contact_email = contact.get("contact_email", "")
+                result.contact_phone = contact.get("contact_phone", "")
+                print(f"  Contact found : {result.contact_name} ({result.contact_title})")
+            else:
+                print(f"  No contact found via Apollo.")
+
         results.append(result)
 
         with open(output_file, "w") as f:
@@ -569,7 +683,8 @@ def process_brands(brands: list, use_claude: bool = True, output_file: str = "re
         with open(csv_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=[
                 "input_brand", "amazon_search_url", "official_website",
-                "confidence", "notes", "seller_business_name", "seller_business_address"
+                "confidence", "notes", "seller_business_name", "seller_business_address",
+                "contact_name", "contact_title", "contact_email", "contact_phone"
             ])
             writer.writeheader()
             writer.writerows([asdict(r) for r in results])
@@ -592,6 +707,10 @@ def print_summary(results: list):
             print(f"  Business name : {r.seller_business_name}")
         if r.seller_business_address:
             print(f"  Address       : {r.seller_business_address}")
+        if r.contact_name:
+            print(f"  Contact       : {r.contact_name} ({r.contact_title})")
+            print(f"  Email         : {r.contact_email}")
+            print(f"  Phone         : {r.contact_phone}")
         print(f"  Confidence    : {r.confidence}")
         if r.notes:
             print(f"  Notes         : {r.notes}")
