@@ -57,6 +57,9 @@ class BrandResult:
     contact_title: str = ""
     contact_email: str = ""
     contact_phone: str = ""
+    website_contact_email: str = ""
+    website_contact_phone: str = ""
+    company_linkedin_url: str = ""
 
 
 def random_delay(min_s=2.0, max_s=5.0):
@@ -333,6 +336,73 @@ def find_official_website(brand_name: str) -> str:
     ), reverse=True)
 
     return scored[0][2]
+
+
+PHONE_PATTERN = re.compile(
+    r'(\+?\d{1,2}[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}\b'
+)
+CONTACT_PAGE_PATHS = ["/contact", "/contact-us", "/pages/contact", "/pages/contact-us", "/contacts"]
+
+
+def find_website_contact_info(website: str) -> tuple:
+    """
+    Visit the brand's website (and common contact-page paths) looking for
+    a public email address (mailto: link) and phone number.
+    Returns (email, phone) — either may be "" if not found.
+    """
+    if not HAS_REQUESTS or not website:
+        return "", ""
+
+    pages_to_try = [website] + [website.rstrip("/") + p for p in CONTACT_PAGE_PATHS]
+
+    for page_url in pages_to_try:
+        try:
+            resp = requests.get(page_url, headers=amazon_headers(), timeout=12)
+            if resp.status_code != 200:
+                continue
+        except Exception:
+            continue
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        email = ""
+        mailto = soup.find("a", href=re.compile(r"^mailto:", re.I))
+        if mailto:
+            email = mailto["href"].split(":", 1)[1].split("?")[0].strip()
+
+        phone = ""
+        tel = soup.find("a", href=re.compile(r"^tel:", re.I))
+        if tel:
+            phone = tel["href"].split(":", 1)[1].strip()
+        else:
+            text = soup.get_text(" ", strip=True)
+            match = PHONE_PATTERN.search(text)
+            if match:
+                phone = match.group().strip()
+
+        if email or phone:
+            return email, phone
+
+        random_delay(1, 2)
+
+    return "", ""
+
+
+def find_company_linkedin(brand_name: str) -> str:
+    """Search for '{brand} LinkedIn' and return the first company LinkedIn page URL."""
+    try:
+        with DDGS() as ddgs:
+            results = list(ddgs.text(f"{brand_name} LinkedIn", max_results=10))
+    except Exception as e:
+        print(f"  [linkedin search error] {e}")
+        return ""
+
+    for r in results:
+        url = r.get("href", "")
+        if "linkedin.com/company/" in url.lower():
+            return clean_url(url)
+
+    return ""
 
 
 def amazon_headers() -> dict:
@@ -646,6 +716,22 @@ def process_brands(brands: list, use_claude: bool = True, output_file: str = "re
                     result.confidence = validation.get("confidence", result.confidence)
                     result.notes = validation.get("notes", "")
                     print(f"  Confidence    : {result.confidence}")
+
+            print(f"  Checking website for contact email/phone...")
+            email, phone = find_website_contact_info(result.official_website)
+            result.website_contact_email = email
+            result.website_contact_phone = phone
+            if email:
+                print(f"  Website email : {email}")
+            if phone:
+                print(f"  Website phone : {phone}")
+
+            print(f"  Searching for company LinkedIn page...")
+            linkedin_url = find_company_linkedin(brand)
+            result.company_linkedin_url = linkedin_url
+            if linkedin_url:
+                print(f"  LinkedIn      : {linkedin_url}")
+            random_delay(2, 3)
         else:
             print(f"  Website not found — trying Amazon seller lookup...")
             seller_info = find_seller_via_amazon(brand)
@@ -686,7 +772,8 @@ def process_brands(brands: list, use_claude: bool = True, output_file: str = "re
             writer = csv.DictWriter(f, fieldnames=[
                 "input_brand", "amazon_search_url", "official_website",
                 "confidence", "notes", "seller_business_name", "seller_business_address",
-                "contact_name", "contact_title", "contact_email", "contact_phone"
+                "contact_name", "contact_title", "contact_email", "contact_phone",
+                "website_contact_email", "website_contact_phone", "company_linkedin_url"
             ])
             writer.writeheader()
             writer.writerows([asdict(r) for r in results])
@@ -713,6 +800,12 @@ def print_summary(results: list):
             print(f"  Contact       : {r.contact_name} ({r.contact_title})")
             print(f"  Email         : {r.contact_email}")
             print(f"  Phone         : {r.contact_phone}")
+        if r.website_contact_email:
+            print(f"  Website email : {r.website_contact_email}")
+        if r.website_contact_phone:
+            print(f"  Website phone : {r.website_contact_phone}")
+        if r.company_linkedin_url:
+            print(f"  LinkedIn      : {r.company_linkedin_url}")
         print(f"  Confidence    : {r.confidence}")
         if r.notes:
             print(f"  Notes         : {r.notes}")
