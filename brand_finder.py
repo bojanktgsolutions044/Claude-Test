@@ -549,9 +549,10 @@ def find_apollo_organization_id(website: str, brand_name: str) -> Optional[str]:
         return None
 
     if resp.status_code in (401, 403, 429):
-        print(f"  [apollo] Out of credits")
+        print(f"  [apollo] organizations/search error {resp.status_code}: {resp.text[:300]}")
         return "OUT_OF_CREDITS"
     if resp.status_code != 200:
+        print(f"  [apollo] organizations/search unexpected status {resp.status_code}: {resp.text[:300]}")
         return None
 
     orgs = resp.json().get("organizations", [])
@@ -591,9 +592,10 @@ def find_apollo_contact(brand_name: str, website: str) -> dict:
         return {}
 
     if resp.status_code in (401, 403, 429):
-        print(f"  [apollo] Out of credits")
+        print(f"  [apollo] mixed_people/search error {resp.status_code}: {resp.text[:300]}")
         return {"_status": "Out of credits"}
     if resp.status_code != 200:
+        print(f"  [apollo] mixed_people/search unexpected status {resp.status_code}: {resp.text[:300]}")
         return {}
 
     people = resp.json().get("people", [])
