@@ -102,39 +102,55 @@ def get_amazon_product_keywords(brand_name: str, max_titles: int = 6) -> list:
     if not HAS_REQUESTS:
         return []
 
+    titles = []
     try:
         resp = requests.get(make_amazon_url(brand_name), headers=amazon_headers(), timeout=15)
-        if resp.status_code != 200:
-            return []
-    except Exception:
-        return []
+        if resp.status_code == 200:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            result_divs = soup.find_all("div", attrs={"data-component-type": "s-search-result"})
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    result_divs = soup.find_all("div", attrs={"data-component-type": "s-search-result"})
+            def is_sponsored(div) -> bool:
+                return bool(div.find(lambda tag: tag.name in ("span", "a") and "Sponsored" in tag.get_text()))
+
+            def extract_titles(divs, allow_sponsored: bool) -> list:
+                found = []
+                for div in divs:
+                    if len(found) >= max_titles:
+                        break
+                    if not allow_sponsored and is_sponsored(div):
+                        continue
+                    h2 = div.find("h2")
+                    title = h2.get_text(" ", strip=True) if h2 else ""
+                    if title:
+                        found.append(title)
+                return found
+
+            # Prefer organic listings; if none are usable, fall back to sponsored ones
+            # rather than returning no product signal at all.
+            titles = extract_titles(result_divs, allow_sponsored=False)
+            if not titles:
+                titles = extract_titles(result_divs, allow_sponsored=True)
+            # Amazon's markup occasionally omits the data-component-type wrapper
+            # (anti-bot variants); fall back to scanning any h2 on the page.
+            if not titles:
+                titles = [h2.get_text(" ", strip=True) for h2 in soup.find_all("h2")][:max_titles]
+    except Exception:
+        pass
+
+    # If direct Amazon scraping yielded nothing (blocked/changed markup), fall
+    # back to a search-engine query restricted to amazon.com listings.
+    if not titles:
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(f"site:amazon.com {brand_name}", max_results=max_titles))
+            for r in results:
+                title = r.get("title", "")
+                if title:
+                    titles.append(title)
+        except Exception as e:
+            print(f"  [amazon keyword fallback search error] {e}")
 
     brand_words = {re.sub(r'[^a-z0-9]', '', w.lower()) for w in brand_name.split()}
-
-    def is_sponsored(div) -> bool:
-        return bool(div.find(lambda tag: tag.name in ("span", "a") and "Sponsored" in tag.get_text()))
-
-    def extract_titles(divs, allow_sponsored: bool) -> list:
-        titles = []
-        for div in divs:
-            if len(titles) >= max_titles:
-                break
-            if not allow_sponsored and is_sponsored(div):
-                continue
-            h2 = div.find("h2")
-            title = h2.get_text(" ", strip=True) if h2 else ""
-            if title:
-                titles.append(title)
-        return titles
-
-    # Prefer organic listings; if none are usable, fall back to sponsored ones
-    # rather than returning no product signal at all.
-    titles = extract_titles(result_divs, allow_sponsored=False)
-    if not titles:
-        titles = extract_titles(result_divs, allow_sponsored=True)
 
     counts = {}
     for title in titles:
