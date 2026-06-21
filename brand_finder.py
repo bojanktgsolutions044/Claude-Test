@@ -113,20 +113,31 @@ def get_amazon_product_keywords(brand_name: str, max_titles: int = 6) -> list:
     result_divs = soup.find_all("div", attrs={"data-component-type": "s-search-result"})
 
     brand_words = {re.sub(r'[^a-z0-9]', '', w.lower()) for w in brand_name.split()}
-    counts = {}
-    titles_used = 0
 
-    for div in result_divs:
-        if titles_used >= max_titles:
-            break
-        # Skip sponsored listings
-        if div.find(lambda tag: tag.name in ("span", "a") and "Sponsored" in tag.get_text()):
-            continue
-        h2 = div.find("h2")
-        title = h2.get_text(" ", strip=True) if h2 else ""
-        if not title:
-            continue
-        titles_used += 1
+    def is_sponsored(div) -> bool:
+        return bool(div.find(lambda tag: tag.name in ("span", "a") and "Sponsored" in tag.get_text()))
+
+    def extract_titles(divs, allow_sponsored: bool) -> list:
+        titles = []
+        for div in divs:
+            if len(titles) >= max_titles:
+                break
+            if not allow_sponsored and is_sponsored(div):
+                continue
+            h2 = div.find("h2")
+            title = h2.get_text(" ", strip=True) if h2 else ""
+            if title:
+                titles.append(title)
+        return titles
+
+    # Prefer organic listings; if none are usable, fall back to sponsored ones
+    # rather than returning no product signal at all.
+    titles = extract_titles(result_divs, allow_sponsored=False)
+    if not titles:
+        titles = extract_titles(result_divs, allow_sponsored=True)
+
+    counts = {}
+    for title in titles:
         for raw in re.findall(r"[a-zA-Z]+", title.lower()):
             if len(raw) < 4 or raw in STOPWORDS or raw in brand_words:
                 continue
@@ -157,7 +168,8 @@ def page_keyword_score(url: str, keywords: list) -> int:
 ECOMMERCE_SIGNALS = [
     "add to cart", "add to bag", "buy now", "shop now", "checkout",
     "in stock", "out of stock", "free shipping", "view cart",
-    "add_to_cart", "shopify", "woocommerce", "product", "shop",
+    "add_to_cart", "shopify", "woocommerce", "add to basket",
+    "shopping cart", "my cart", "track your order",
 ]
 
 
