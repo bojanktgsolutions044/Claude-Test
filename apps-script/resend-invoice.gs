@@ -62,15 +62,39 @@ function setup() {
   Logger.log('Setup complete. Hourly trigger installed.');
 }
 
-/** Write the month into Overview!B2 if it is not already set. */
+/** Write the month into Overview!B2 if it is not already set.
+ *  B2 may be a real Date that DISPLAYS as "May 2026", so compare on the
+ *  formatted month label and, when writing, keep it a Date to avoid
+ *  breaking formulas that expect a date. */
 function ensureOverviewMonth() {
   const ss = SpreadsheetApp.openById(CONFIG.spreadsheetId);
   const ov = ss.getSheetByName(CONFIG.overviewTabName);
   if (!ov) return;
+  const tz = ss.getSpreadsheetTimeZone();
   const b2 = ov.getRange('B2');
-  if (String(b2.getValue()).trim() !== CONFIG.month) {
-    b2.setValue(CONFIG.month);
+  if (monthLabel_(b2.getValue(), tz) === CONFIG.month) return; // already correct
+  const d = parseMonthToDate_(CONFIG.month);
+  b2.setValue(d || CONFIG.month);
+}
+
+/** A cell's month as "MMMM yyyy" - handles both Date cells and plain text. */
+function monthLabel_(value, tz) {
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    return Utilities.formatDate(value, tz, 'MMMM yyyy');
   }
+  return String(value).trim();
+}
+
+/** "May 2026" -> Date (mid-month, noon UTC) so it is timezone-safe. */
+function parseMonthToDate_(label) {
+  const months = ['january','february','march','april','may','june',
+                  'july','august','september','october','november','december'];
+  const parts = String(label).trim().toLowerCase().split(/\s+/);
+  if (parts.length < 2) return null;
+  const m = months.indexOf(parts[0]);
+  const y = parseInt(parts[1], 10);
+  if (m === -1 || isNaN(y)) return null;
+  return new Date(Date.UTC(y, m, 15, 12, 0, 0));
 }
 
 /** The data tab, resolved by gid so a tab rename will not break it. */
@@ -83,10 +107,12 @@ function getDataSheet_() {
 
 /** Map of {emailLower -> {fileId, invoiceNo, company}} for the configured month. */
 function buildInvoiceIndex_() {
-  const values = getDataSheet_().getDataRange().getValues();
+  const sheet = getDataSheet_();
+  const tz = sheet.getParent().getSpreadsheetTimeZone();
+  const values = sheet.getDataRange().getValues();
   const index = {};
   for (let r = 1; r < values.length; r++) { // skip header
-    if (String(values[r][CONFIG.colMonth - 1]).trim() !== CONFIG.month) continue;
+    if (monthLabel_(values[r][CONFIG.colMonth - 1], tz) !== CONFIG.month) continue;
     const fileId = extractDriveId_(String(values[r][CONFIG.colInvoiceLink - 1]).trim());
     if (!fileId) continue;
     const entry = {
