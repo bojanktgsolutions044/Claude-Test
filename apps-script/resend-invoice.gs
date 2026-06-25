@@ -28,7 +28,9 @@ const CONFIG = {
   month: 'May 2026',            // the invoice month being handled
 
   // 1-based column numbers in the data tab:
+  colInvoice: 1,                // A  Invoice #
   colMonth: 2,                  // B  Invoice for Month
+  colCompany: 3,                // C  Company
   colInvoiceLink: 7,            // G  Invoice Link for Accounting (Drive URL)
   colEmail: 11,                 // K  Email For Invoicing
 
@@ -79,7 +81,7 @@ function getDataSheet_() {
   return sheet;
 }
 
-/** Map of {emailLower -> Drive file id} for the configured month. */
+/** Map of {emailLower -> {fileId, invoiceNo, company}} for the configured month. */
 function buildInvoiceIndex_() {
   const values = getDataSheet_().getDataRange().getValues();
   const index = {};
@@ -87,9 +89,14 @@ function buildInvoiceIndex_() {
     if (String(values[r][CONFIG.colMonth - 1]).trim() !== CONFIG.month) continue;
     const fileId = extractDriveId_(String(values[r][CONFIG.colInvoiceLink - 1]).trim());
     if (!fileId) continue;
+    const entry = {
+      fileId: fileId,
+      invoiceNo: String(values[r][CONFIG.colInvoice - 1]).trim(),
+      company: String(values[r][CONFIG.colCompany - 1]).trim()
+    };
     String(values[r][CONFIG.colEmail - 1]).toLowerCase()
       .split(/[,;\s]+/).filter(Boolean)
-      .forEach(e => { index[e] = fileId; });
+      .forEach(e => { index[e] = entry; });
   }
   return index;
 }
@@ -104,8 +111,11 @@ function processInvoiceRequests() {
   ensureOverviewMonth();
   const index = buildInvoiceIndex_();
   const label = GmailApp.getUserLabelByName(CONFIG.draftLabel) || GmailApp.createLabel(CONFIG.draftLabel);
+  const threads = GmailApp.search(CONFIG.gmailSearch + ' -label:' + CONFIG.draftLabel);
+  Logger.log('Scanning %s thread(s) for "%s" invoice-resend requests...', threads.length, CONFIG.month);
 
-  GmailApp.search(CONFIG.gmailSearch + ' -label:' + CONFIG.draftLabel).forEach(thread => {
+  let created = 0;
+  threads.forEach(thread => {
     const msgs = thread.getMessages();
     const last = msgs[msgs.length - 1];
     const subject = (last.getSubject() || '');
@@ -115,17 +125,24 @@ function processInvoiceRequests() {
     if (!CONFIG.triggerPhrases.some(p => body.indexOf(p) !== -1)) return;
 
     const sender = extractEmail_(last.getFrom()).toLowerCase();
-    const fileId = index[sender];
-    if (!fileId) return; // sender not found in column K for this month
+    const entry = index[sender];
+    if (!entry) {
+      Logger.log('SKIP: %s asked to resend but is not in column K for %s.', sender, CONFIG.month);
+      return;
+    }
 
-    const blob = DriveApp.getFileById(fileId).getBlob();
+    const blob = DriveApp.getFileById(entry.fileId).getBlob();
     const draftBody = 'Hello,\n\n'
       + 'Apologies for any trouble locating it. Please find your invoice attached.\n\n'
       + 'Best regards,';
 
     last.createDraftReply(draftBody, { attachments: [blob] });
     thread.addLabel(label); // mark handled to avoid duplicate drafts next run
+    created++;
+    Logger.log('Created draft for %s (invoice %s - %s).', sender, entry.invoiceNo, entry.company);
   });
+
+  Logger.log('Done. %s draft(s) created.', created);
 }
 
 function extractEmail_(from) {
