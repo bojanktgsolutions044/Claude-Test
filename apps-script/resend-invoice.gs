@@ -149,3 +149,26 @@ function extractEmail_(from) {
   const m = from.match(/<([^>]+)>/);
   return m ? m[1] : from.trim();
 }
+
+/**
+ * One-off tester: forces a draft WITH the invoice PDF attached for one
+ * address that exists in column K. Use it to confirm the attachment path
+ * works without waiting for a real "resend" email. Edit TEST_EMAIL first.
+ */
+function testOnSender() {
+  const TEST_EMAIL = 'hq@smolotov.com'; // <-- change to any email in column K
+  const entry = buildInvoiceIndex_()[TEST_EMAIL.toLowerCase()];
+  if (!entry) {
+    Logger.log('Not found in column K for %s: %s', CONFIG.month, TEST_EMAIL);
+    return;
+  }
+  const blob = DriveApp.getFileById(entry.fileId).getBlob();
+  GmailApp.createDraft(
+    TEST_EMAIL,
+    'Invoice ' + entry.invoiceNo + ' - ' + entry.company,
+    'Hello,\n\nPlease find your invoice attached.\n\nBest regards,',
+    { attachments: [blob] }
+  );
+  Logger.log('Test draft created for %s (invoice %s) with "%s" attached.',
+    TEST_EMAIL, entry.invoiceNo, blob.getName());
+}
